@@ -1,1 +1,364 @@
+import discord
+from discord.ext import commands, tasks
+from discord import app_commands
+from utils import *
+import aiosqlite
+from datetime import datetime, timedelta, timezone
+import asyncio
 
+class AutoDeleteCog(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+        self.auto_delete_channels = {}  # {channel_id: {'duration': seconds, 'messages': []}}
+        self.cleanup_task.start()
+        
+    def cog_unload(self):
+        self.cleanup_task.cancel()
+    
+    async def setup_adm_tables(self):
+        """Initialize auto delete tables in database"""
+        async with aiosqlite.connect('bot.db') as db:
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS auto_delete_channels (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    guild_id INTEGER,
+                    channel_id INTEGER,
+                    duration INTEGER,
+                    log_channel_id INTEGER,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(guild_id, channel_id)
+                )
+            ''')
+            
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS auto_delete_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    guild_id INTEGER,
+                    channel_id INTEGER,
+                    user_id INTEGER,
+                    content TEXT,
+                    deleted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            await db.commit()
+            
+            # Load existing configurations
+            cursor = await db.execute('SELECT channel_id, duration FROM auto_delete_channels')
+            configs = await cursor.fetchall()
+            for channel_id, duration in configs:
+                self.auto_delete_channels[channel_id] = {'duration': duration, 'messages': []}
+    
+    @commands.hybrid_group(name='adm')
+    @commands.has_permissions(manage_channels=True)
+    async def adm(self, ctx):
+        """automatic message deletion system"""
+        if ctx.invoked_subcommand is None:
+            import sys; sys.path.append("."); from utils import create_command_usage_embed
+            prefix = await self.bot.get_guild_prefix(ctx.guild.id) if ctx.guild else ";"
+            embed = create_command_usage_embed(
+                self.bot, 
+                "adm", 
+                "automatic message deletion system.", 
+                "adm", 
+                "adm <set|unset|status|logs>",
+                prefix
+            )
+            await ctx.send(embed=embed, ephemeral=True)
+    
+    @adm.command(name='set')
+    @app_commands.describe(
+        channel="the channel where messages should be auto-deleted (supports NSFW channels)",
+        duration="time in seconds before deletion (example: 30s for 30 seconds, min 1s, max 600s)",
+        log_channel="optional: channel to send deleted message logs to"
+    )
+    async def set_auto_delete(self, ctx, channel: discord.TextChannel = None, duration: str = None, log_channel: discord.TextChannel = None):
+        """enable auto message deletion in a channel (works with NSFW channels)"""
+        await self.setup_adm_tables()
+        
+        if not channel or not duration:
+            import sys; sys.path.append("."); from utils import create_command_usage_embed
+            prefix = await self.bot.get_guild_prefix(ctx.guild.id) if ctx.guild else "."
+            embed = create_command_usage_embed(
+                self.bot, 
+                "adm set", 
+                "enable auto message deletion in a channel.", 
+                "adm set", 
+                "adm set <#channel> <duration> [#log_channel]",
+                prefix
+            )
+            await ctx.send(embed=embed, ephemeral=True)
+            return
+        
+        # Parse duration - only accept seconds format
+        try:
+            if not duration.endswith('s'):
+                embed = create_embed("invalid duration", "duration must end with 's' (seconds only). example: 300s")
+                await ctx.send(embed=embed, ephemeral=True)
+                return
+            
+            total_seconds = int(duration[:-1])
+        except ValueError:
+            embed = create_embed("invalid duration", "duration must be a number followed by 's'. example: 300s")
+            await ctx.send(embed=embed, ephemeral=True)
+            return
+        if total_seconds > 600:  # 10 minutes max
+            embed = create_embed("duration too long", "maximum duration is 10 minutes")
+            await ctx.send(embed=embed, ephemeral=True)
+            return
+        
+        if total_seconds < 1:  # 1 second minimum
+            embed = create_embed("duration too short", "minimum duration is 1 second")
+            await ctx.send(embed=embed, ephemeral=True)
+            return
+        
+        # Store in database
+        async with aiosqlite.connect('bot.db') as db:
+            await db.execute('''
+                INSERT OR REPLACE INTO auto_delete_channels 
+                (guild_id, channel_id, duration, log_channel_id)
+                VALUES (?, ?, ?, ?)
+            ''', (ctx.guild.id, channel.id, total_seconds, log_channel.id if log_channel else None))
+            await db.commit()
+        
+        # Update memory
+        self.auto_delete_channels[channel.id] = {'duration': total_seconds, 'messages': []}
+        
+        log_info = f" â¢ logs to {log_channel.mention}" if log_channel else ""
+        embed = create_embed("auto delete enabled", 
+                           f"messages in {channel.mention} will be deleted after {duration}{log_info}")
+        await ctx.send(embed=embed)
+    
+    @adm.command(name='unset')
+    @app_commands.describe(channel="the channel to disable auto-deletion for")
+    async def unset_auto_delete(self, ctx, channel: discord.TextChannel = None):
+        """disable auto message deletion in a channel"""
+        await self.setup_adm_tables()
+        
+        if not channel:
+            import sys; sys.path.append("."); from utils import create_command_usage_embed
+            prefix = await self.bot.get_guild_prefix(ctx.guild.id) if ctx.guild else "."
+            embed = create_command_usage_embed(
+                self.bot, 
+                "adm unset", 
+                "disable auto message deletion in a channel.", 
+                "adm unset", 
+                "adm unset <#channel>",
+                prefix
+            )
+            await ctx.send(embed=embed, ephemeral=True)
+            return
+        
+        async with aiosqlite.connect('bot.db') as db:
+            cursor = await db.execute('''
+                DELETE FROM auto_delete_channels WHERE guild_id = ? AND channel_id = ?
+            ''', (ctx.guild.id, channel.id))
+            await db.commit()
+            
+            if cursor.rowcount == 0:
+                embed = create_embed("not configured", f"{channel.mention} doesn't have auto delete enabled")
+                await ctx.send(embed=embed, ephemeral=True)
+                return
+        
+        # Remove from memory
+        if channel.id in self.auto_delete_channels:
+            del self.auto_delete_channels[channel.id]
+        
+        embed = create_embed("auto delete disabled", f"disabled auto deletion in {channel.mention}")
+        await ctx.send(embed=embed)
+    
+    @adm.command(name='status')
+    async def status_auto_delete(self, ctx):
+        """show auto delete status for this server"""
+        await self.setup_adm_tables()
+        
+        async with aiosqlite.connect('bot.db') as db:
+            cursor = await db.execute('''
+                SELECT channel_id, duration, log_channel_id FROM auto_delete_channels 
+                WHERE guild_id = ?
+            ''', (ctx.guild.id,))
+            configs = await cursor.fetchall()
+        
+        if not configs:
+            embed = create_embed("no auto delete channels", "no channels have auto deletion enabled")
+            await ctx.send(embed=embed)
+            return
+        
+        description = ""
+        for channel_id, duration, log_channel_id in configs:
+            channel = ctx.guild.get_channel(channel_id)
+            log_channel = ctx.guild.get_channel(log_channel_id) if log_channel_id else None
+            
+            if channel:
+                duration_str = f"{duration}s"
+                log_info = f" â {log_channel.mention}" if log_channel else ""
+                nsfw_indicator = " ð" if channel.nsfw else ""
+                description += f"{channel.mention}{nsfw_indicator} - {duration_str}{log_info}\n"
+        
+        embed = create_embed("auto delete status", description.strip() if description else "no valid channels found")
+        await ctx.send(embed=embed)
+    
+    @adm.command(name='logs')
+    @app_commands.describe(
+        channel="the channel to view deleted message logs for",
+        limit="number of recent deleted messages to show (default: 10, max: 50)"
+    )
+    async def logs_auto_delete(self, ctx, channel: discord.TextChannel = None, limit: int = 10):
+        """view recently deleted messages from auto-deletion system"""
+        await self.setup_adm_tables()
+        
+        if not channel:
+            import sys; sys.path.append("."); from utils import create_command_usage_embed
+            prefix = await self.bot.get_guild_prefix(ctx.guild.id) if ctx.guild else "."
+            embed = create_command_usage_embed(
+                self.bot, 
+                "adm logs", 
+                "view recently deleted messages from auto-deletion system.", 
+                "adm logs", 
+                "adm logs <#channel> [limit]",
+                prefix
+            )
+            await ctx.send(embed=embed, ephemeral=True)
+            return
+        
+        if limit > 50:
+            limit = 50
+        elif limit < 1:
+            limit = 10
+        
+        async with aiosqlite.connect('bot.db') as db:
+            cursor = await db.execute('''
+                SELECT user_id, content, deleted_at FROM auto_delete_logs 
+                WHERE guild_id = ? AND channel_id = ?
+                ORDER BY deleted_at DESC LIMIT ?
+            ''', (ctx.guild.id, channel.id, limit))
+            logs = await cursor.fetchall()
+        
+        if not logs:
+            embed = create_embed("no logs found", f"no auto-deleted messages found for {channel.mention}")
+            await ctx.send(embed=embed)
+            return
+        
+        description = ""
+        for user_id, content, deleted_at in logs:
+            user = ctx.guild.get_member(user_id)
+            username = user.display_name if user else f"unknown user"
+            timestamp = datetime.fromisoformat(deleted_at).strftime("%m/%d %H:%M")
+            
+            # Truncate long messages
+            display_content = content[:80] + "..." if len(content) > 80 else content
+            description += f"`{timestamp}` **{username}:** {display_content}\n"
+        
+        embed = create_embed(f"auto delete logs - {channel.name}", description.strip())
+        embed.add_field(name="note", value=f"showing last {len(logs)} deleted messages", inline=False)
+        await ctx.send(embed=embed)
+    
+    @commands.Cog.listener()
+    async def on_message(self, message):
+        """Handle auto deletion of messages"""
+        if message.author.bot:
+            return
+        
+        if message.channel.id not in self.auto_delete_channels:
+            return
+        
+        # Don't auto-delete command messages - get dynamic prefix from bot
+        prefix = "."
+        try:
+            # Get the actual prefix for this guild
+            if hasattr(self.bot, 'get_prefix'):
+                prefix_result = await self.bot.get_prefix(message)
+                if isinstance(prefix_result, str):
+                    prefix = prefix_result
+                elif isinstance(prefix_result, list) and prefix_result:
+                    prefix = prefix_result[0]
+        except:
+            prefix = "."
+        
+        # Skip command messages (prefix commands and slash commands)
+        if message.content.startswith((prefix, '/', '!')):
+            return
+        
+        config = self.auto_delete_channels[message.channel.id]
+        delete_time = datetime.now(timezone.utc) + timedelta(seconds=config['duration'])
+        
+        # Add to message queue
+        config['messages'].append({
+            'message': message,
+            'delete_time': delete_time,
+            'content': message.content,
+            'author_id': message.author.id
+        })
+    
+    @tasks.loop(seconds=5)
+    async def cleanup_task(self):
+        """Delete messages that have reached their deletion time"""
+        current_time = datetime.now(timezone.utc)
+        
+        for channel_id, config in self.auto_delete_channels.items():
+            messages_to_delete = []
+            
+            for msg_data in config['messages'][:]:
+                if current_time >= msg_data['delete_time']:
+                    try:
+                        # Delete the message
+                        await msg_data['message'].delete()
+                        
+                        # Log to database
+                        await self.log_deleted_message(
+                            msg_data['message'].guild.id,
+                            channel_id,
+                            msg_data['author_id'],
+                            msg_data['content']
+                        )
+                        
+                        # Send to log channel if configured
+                        await self.send_delete_log(msg_data['message'], channel_id)
+                        
+                    except discord.NotFound:
+                        pass  # Message already deleted
+                    except discord.Forbidden:
+                        pass  # No permission to delete
+                    
+                    config['messages'].remove(msg_data)
+    
+    async def log_deleted_message(self, guild_id, channel_id, user_id, content):
+        """Log deleted message to database"""
+        async with aiosqlite.connect('bot.db') as db:
+            await db.execute('''
+                INSERT INTO auto_delete_logs (guild_id, channel_id, user_id, content)
+                VALUES (?, ?, ?, ?)
+            ''', (guild_id, channel_id, user_id, content))
+            await db.commit()
+    
+    async def send_delete_log(self, message, channel_id):
+        """Send deleted message to configured log channel"""
+        async with aiosqlite.connect('bot.db') as db:
+            cursor = await db.execute('''
+                SELECT log_channel_id FROM auto_delete_channels 
+                WHERE guild_id = ? AND channel_id = ?
+            ''', (message.guild.id, channel_id))
+            result = await cursor.fetchone()
+            
+            if result and result[0]:
+                log_channel = message.guild.get_channel(result[0])
+                if log_channel:
+                    embed = discord.Embed(
+                        title="auto deleted message",
+                        description=f"**channel:** {message.channel.mention}\n**author:** {message.author.mention}\n**content:** {message.content[:1900]}",
+                        color=0xff9900,
+                        timestamp=datetime.now(timezone.utc)
+                    )
+                    embed.set_footer(text=str(self.bot.user))
+                    
+                    try:
+                        await log_channel.send(embed=embed)
+                    except discord.Forbidden:
+                        pass
+    
+    @cleanup_task.before_loop
+    async def before_cleanup_task(self):
+        await self.bot.wait_until_ready()
+        await self.setup_adm_tables()
+
+async def setup(bot):
+    await bot.add_cog(AutoDeleteCog(bot))
