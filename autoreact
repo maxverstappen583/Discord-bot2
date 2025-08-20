@@ -1,0 +1,444 @@
+import discord
+from discord.ext import commands
+from discord import app_commands
+import aiosqlite
+import re
+from utils import create_embed, create_success_embed, create_error_embed, is_mod_or_higher
+
+DATABASE_PATH = 'bot.db'
+
+class AutoReact(commands.Cog):
+    """Auto-reaction system for custom triggers"""
+
+    def __init__(self, bot):
+        self.bot = bot
+
+    async def cog_load(self):
+        """Initialize database table for autoreact"""
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS autoreact_triggers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    guild_id INTEGER,
+                    trigger_text TEXT,
+                    emojis TEXT,
+                    is_regex BOOLEAN DEFAULT 0,
+                    case_sensitive BOOLEAN DEFAULT 0,
+                    created_by INTEGER,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            await db.commit()
+
+    @commands.hybrid_group(name="autoreact", description="manage auto-reaction triggers")
+    @is_mod_or_higher()
+    async def autoreact(self, ctx):
+        """Auto-reaction system management"""
+        if ctx.invoked_subcommand is None:
+            embed = create_embed(
+                title="ð­ auto-reaction system",
+                description="automatically react to messages with emojis based on triggers",
+                color=0x9B59B6
+            )
+            embed.add_field(
+                name="commands",
+                value="â¢ `/autoreact add` - add new trigger\nâ¢ `/autoreact list` - view all triggers\nâ¢ `/autoreact edit` - edit existing trigger\nâ¢ `/autoreact remove` - remove trigger",
+                inline=False
+            )
+            embed.add_field(
+                name="features",
+                value="â¢ custom text triggers\nâ¢ multiple emoji reactions\nâ¢ regex pattern support\nâ¢ case sensitivity options",
+                inline=False
+            )
+            await ctx.send(embed=embed, ephemeral=True)
+
+    @autoreact.command(name="add")
+    @app_commands.describe(trigger="text that will trigger the reactions")
+    async def autoreact_add(self, ctx, trigger: str = None):
+        """Add a new auto-reaction trigger"""
+        if trigger:
+            # Quick add with modal for emojis
+            modal = AutoReactModal(ctx.guild.id, ctx.author.id, trigger_text=trigger)
+        else:
+            # Full modal for everything
+            modal = AutoReactModal(ctx.guild.id, ctx.author.id)
+        
+        # Handle both slash and prefix commands
+        if ctx.interaction:
+            await ctx.interaction.response.send_modal(modal)
+        else:
+            # For prefix commands, we need to create an interaction-like response
+            embed = create_embed(
+                title="ð­ add auto-reaction trigger",
+                description="use the slash command version (`/autoreact add`) for the interactive modal interface",
+                color=0x9B59B6
+            )
+            await ctx.send(embed=embed, ephemeral=True)
+
+    @autoreact.command(name="list")
+    async def autoreact_list(self, ctx):
+        """List all auto-reaction triggers for this server"""
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            cursor = await db.execute('''
+                SELECT id, trigger_text, emojis, is_regex, case_sensitive, created_by
+                FROM autoreact_triggers 
+                WHERE guild_id = ? 
+                ORDER BY id DESC
+            ''', (ctx.guild.id,))
+            triggers = await cursor.fetchall()
+
+        if not triggers:
+            embed = create_error_embed("no auto-reaction triggers found for this server")
+            await ctx.send(embed=embed, ephemeral=True)
+            return
+
+        embed = create_embed(
+            title="ð­ auto-reaction triggers",
+            description=f"showing {len(triggers)} triggers for this server",
+            color=0x9B59B6
+        )
+
+        for trigger_id, trigger_text, emojis, is_regex, case_sensitive, created_by in triggers:
+            creator = ctx.guild.get_member(created_by)
+            creator_name = creator.display_name if creator else f"User {created_by}"
+
+            flags = []
+            if is_regex:
+                flags.append("regex")
+            if case_sensitive:
+                flags.append("case-sensitive")
+
+            flag_text = f" ({', '.join(flags)})" if flags else ""
+
+            embed.add_field(
+                name=f"ID {trigger_id} - {trigger_text[:30]}{'...' if len(trigger_text) > 30 else ''}",
+                value=f"**emojis:** {emojis}\n**creator:** {creator_name}{flag_text}",
+                inline=False
+            )
+
+        # Split into multiple embeds if too many triggers
+        if len(embed.fields) > 10:
+            embed.fields = embed.fields[:10]
+            embed.set_footer(text=f"showing first 10 of {len(triggers)} triggers")
+
+        await ctx.send(embed=embed, ephemeral=True)
+
+    @autoreact.command(name="edit")
+    @app_commands.describe(trigger_id="id of the trigger to edit (use /autoreact list to see ids)")
+    async def autoreact_edit(self, ctx, trigger_id: int):
+        """Edit an existing auto-reaction trigger"""
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            cursor = await db.execute('''
+                SELECT trigger_text, emojis, is_regex, case_sensitive, created_by
+                FROM autoreact_triggers 
+                WHERE id = ? AND guild_id = ?
+            ''', (trigger_id, ctx.guild.id))
+            result = await cursor.fetchone()
+
+        if not result:
+            embed = create_error_embed(f"trigger with ID {trigger_id} not found")
+            await ctx.send(embed=embed, ephemeral=True)
+            return
+
+        trigger_text, emojis, is_regex, case_sensitive, created_by = result
+
+        # Check if user can edit (creator or admin)
+        if ctx.author.id != created_by and not ctx.author.guild_permissions.administrator:
+            embed = create_error_embed("you can only edit triggers you created (unless you're an admin)")
+            await ctx.send(embed=embed, ephemeral=True)
+            return
+
+        modal = AutoReactEditModal(ctx.guild.id, trigger_id, trigger_text, emojis, is_regex, case_sensitive)
+        
+        # Handle both slash and prefix commands
+        if ctx.interaction:
+            await ctx.interaction.response.send_modal(modal)
+        else:
+            # For prefix commands, we need to create an interaction-like response
+            embed = create_embed(
+                title="ð­ edit auto-reaction trigger",
+                description="use the slash command version (`/autoreact edit`) for the interactive modal interface",
+                color=0x9B59B6
+            )
+            await ctx.send(embed=embed, ephemeral=True)
+
+    @autoreact.command(name="remove")
+    @app_commands.describe(trigger_id="id of the trigger to remove (use /autoreact list to see ids)")
+    async def autoreact_remove(self, ctx, trigger_id: int):
+        """Remove an auto-reaction trigger"""
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            cursor = await db.execute('''
+                SELECT trigger_text, created_by
+                FROM autoreact_triggers 
+                WHERE id = ? AND guild_id = ?
+            ''', (trigger_id, ctx.guild.id))
+            result = await cursor.fetchone()
+
+            if not result:
+                embed = create_error_embed(f"trigger with ID {trigger_id} not found")
+                await ctx.send(embed=embed, ephemeral=True)
+                return
+
+            trigger_text, created_by = result
+
+            # Check if user can remove (creator or admin)
+            if ctx.author.id != created_by and not ctx.author.guild_permissions.administrator:
+                embed = create_error_embed("you can only remove triggers you created (unless you're an admin)")
+                await ctx.send(embed=embed, ephemeral=True)
+                return
+
+            await db.execute('DELETE FROM autoreact_triggers WHERE id = ? AND guild_id = ?', 
+                           (trigger_id, ctx.guild.id))
+            await db.commit()
+
+        embed = create_success_embed(f"removed auto-reaction trigger: **{trigger_text}**")
+        await ctx.send(embed=embed, ephemeral=True)
+
+    @commands.Cog.listener()
+    async def on_message(self, message):
+        """Check messages for auto-reaction triggers"""
+        if message.author.bot or not message.guild:
+            return
+
+        # Get all triggers for this guild
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            cursor = await db.execute('''
+                SELECT trigger_text, emojis, is_regex, case_sensitive
+                FROM autoreact_triggers 
+                WHERE guild_id = ?
+            ''', (message.guild.id,))
+            triggers = await cursor.fetchall()
+
+        if not triggers:
+            return
+
+        message_content = message.content
+
+        for trigger_text, emojis, is_regex, case_sensitive in triggers:
+            matched = False
+
+            try:
+                if is_regex:
+                    # Use regex matching
+                    flags = 0 if case_sensitive else re.IGNORECASE
+                    if re.search(trigger_text, message_content, flags):
+                        matched = True
+                else:
+                    # Simple text matching
+                    if case_sensitive:
+                        matched = trigger_text in message_content
+                    else:
+                        matched = trigger_text.lower() in message_content.lower()
+
+                if matched:
+                    # Add reactions
+                    emoji_list = emojis.split()
+                    for emoji in emoji_list:
+                        try:
+                            await message.add_reaction(emoji.strip())
+                        except (discord.HTTPException, discord.InvalidArgument):
+                            # Skip invalid emojis
+                            continue
+
+            except re.error:
+                # Skip invalid regex patterns
+                continue
+
+class AutoReactModal(discord.ui.Modal):
+    """Modal for creating new auto-reaction triggers"""
+
+    def __init__(self, guild_id: int, user_id: int, trigger_text: str = None):
+        super().__init__(title="add auto-reaction trigger")
+        self.guild_id = guild_id
+        self.user_id = user_id
+
+        self.trigger = discord.ui.TextInput(
+            label="trigger text or regex pattern",
+            placeholder="text that will trigger reactions (e.g., 'hello', '\\bhappy\\b')",
+            default=trigger_text or "",
+            max_length=500
+        )
+        self.add_item(self.trigger)
+
+        self.emojis = discord.ui.TextInput(
+            label="emojis to react with",
+            placeholder="emojis separated by spaces (e.g., ð ð ð or :custom: :emoji:)",
+            max_length=200
+        )
+        self.add_item(self.emojis)
+
+        self.options = discord.ui.TextInput(
+            label="options (optional)",
+            placeholder="regex=yes/no, case_sensitive=yes/no (default: regex=no, case_sensitive=no)",
+            required=False,
+            max_length=100
+        )
+        self.add_item(self.options)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            trigger_text = self.trigger.value.strip()
+            emojis = self.emojis.value.strip()
+
+            if not trigger_text or not emojis:
+                embed = create_error_embed("both trigger text and emojis are required")
+                await interaction.response.send_message(embed=embed, ephemeral=True)
+                return
+
+            # Parse options
+            is_regex = False
+            case_sensitive = False
+
+            if self.options.value:
+                options_text = self.options.value.lower()
+                if 'regex=yes' in options_text or 'regex=true' in options_text:
+                    is_regex = True
+                if 'case_sensitive=yes' in options_text or 'case_sensitive=true' in options_text:
+                    case_sensitive = True
+
+            # Validate regex if enabled
+            if is_regex:
+                try:
+                    re.compile(trigger_text)
+                except re.error as e:
+                    embed = create_error_embed(f"invalid regex pattern: {str(e)}")
+                    await interaction.response.send_message(embed=embed, ephemeral=True)
+                    return
+
+            # Validate emojis
+            emoji_list = emojis.split()
+            if len(emoji_list) > 10:
+                embed = create_error_embed("maximum 10 emojis allowed per trigger")
+                await interaction.response.send_message(embed=embed, ephemeral=True)
+                return
+
+            # Save to database
+            async with aiosqlite.connect(DATABASE_PATH) as db:
+                await db.execute('''
+                    INSERT INTO autoreact_triggers (guild_id, trigger_text, emojis, is_regex, case_sensitive, created_by)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', (self.guild_id, trigger_text, emojis, is_regex, case_sensitive, self.user_id))
+                await db.commit()
+
+            embed = create_success_embed(f"created auto-reaction trigger: **{trigger_text}**")
+            embed.add_field(name="emojis", value=emojis, inline=True)
+
+            flags = []
+            if is_regex:
+                flags.append("regex")
+            if case_sensitive:
+                flags.append("case-sensitive")
+            if flags:
+                embed.add_field(name="options", value=", ".join(flags), inline=True)
+
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+
+        except Exception as e:
+            embed = create_error_embed(f"error creating trigger: {str(e)}")
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+
+class AutoReactEditModal(discord.ui.Modal):
+    """Modal for editing existing auto-reaction triggers"""
+
+    def __init__(self, guild_id: int, trigger_id: int, current_trigger: str, current_emojis: str, is_regex: bool, case_sensitive: bool):
+        super().__init__(title=f"edit trigger #{trigger_id}")
+        self.guild_id = guild_id
+        self.trigger_id = trigger_id
+
+        self.trigger = discord.ui.TextInput(
+            label="trigger text or regex pattern",
+            placeholder="text that will trigger reactions",
+            default=current_trigger,
+            max_length=500
+        )
+        self.add_item(self.trigger)
+
+        self.emojis = discord.ui.TextInput(
+            label="emojis to react with",
+            placeholder="emojis separated by spaces",
+            default=current_emojis,
+            max_length=200
+        )
+        self.add_item(self.emojis)
+
+        options_default = []
+        if is_regex:
+            options_default.append("regex=yes")
+        if case_sensitive:
+            options_default.append("case_sensitive=yes")
+
+        self.options = discord.ui.TextInput(
+            label="options (optional)",
+            placeholder="regex=yes/no, case_sensitive=yes/no",
+            default=", ".join(options_default),
+            required=False,
+            max_length=100
+        )
+        self.add_item(self.options)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            trigger_text = self.trigger.value.strip()
+            emojis = self.emojis.value.strip()
+
+            if not trigger_text or not emojis:
+                embed = create_error_embed("both trigger text and emojis are required")
+                await interaction.response.send_message(embed=embed, ephemeral=True)
+                return
+
+            # Parse options
+            is_regex = False
+            case_sensitive = False
+
+            if self.options.value:
+                options_text = self.options.value.lower()
+                if 'regex=yes' in options_text or 'regex=true' in options_text:
+                    is_regex = True
+                if 'case_sensitive=yes' in options_text or 'case_sensitive=true' in options_text:
+                    case_sensitive = True
+
+            # Validate regex if enabled
+            if is_regex:
+                try:
+                    re.compile(trigger_text)
+                except re.error as e:
+                    embed = create_error_embed(f"invalid regex pattern: {str(e)}")
+                    await interaction.response.send_message(embed=embed, ephemeral=True)
+                    return
+
+            # Validate emojis
+            emoji_list = emojis.split()
+            if len(emoji_list) > 10:
+                embed = create_error_embed("maximum 10 emojis allowed per trigger")
+                await interaction.response.send_message(embed=embed, ephemeral=True)
+                return
+
+            # Update database
+            async with aiosqlite.connect(DATABASE_PATH) as db:
+                await db.execute('''
+                    UPDATE autoreact_triggers 
+                    SET trigger_text = ?, emojis = ?, is_regex = ?, case_sensitive = ?
+                    WHERE id = ? AND guild_id = ?
+                ''', (trigger_text, emojis, is_regex, case_sensitive, self.trigger_id, self.guild_id))
+                await db.commit()
+
+            embed = create_success_embed(f"updated auto-reaction trigger #{self.trigger_id}")
+            embed.add_field(name="trigger", value=trigger_text, inline=False)
+            embed.add_field(name="emojis", value=emojis, inline=True)
+
+            flags = []
+            if is_regex:
+                flags.append("regex")
+            if case_sensitive:
+                flags.append("case-sensitive")
+            if flags:
+                embed.add_field(name="options", value=", ".join(flags), inline=True)
+
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+
+        except Exception as e:
+            embed = create_error_embed(f"error updating trigger: {str(e)}")
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+
+async def setup(bot):
+    await bot.add_cog(AutoReact(bot))
