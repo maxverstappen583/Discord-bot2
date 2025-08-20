@@ -1,0 +1,159 @@
+"""
+Analytics and Statistics Cog
+Provides server analytics, member statistics, and activity insights.
+"""
+
+import discord
+from discord.ext import commands
+from discord import app_commands
+from utils import *
+from db import DATABASE_PATH
+import aiosqlite
+from datetime import datetime, timedelta
+from collections import defaultdict, Counter
+
+class Analytics(commands.Cog):
+    """Server analytics and statistics"""
+    
+    def __init__(self, bot):
+        self.bot = bot
+        
+    @commands.hybrid_command(name="stats")
+    @app_commands.describe()
+    @is_mod_or_higher()
+    async def server_stats(self, ctx):
+        """view comprehensive server statistics"""
+        guild = ctx.guild
+        
+        # Basic guild info
+        embed = create_embed(
+            title=f"📊 {guild.name} statistics",
+            color=0x3498DB
+        )
+        
+        # Member statistics
+        total_members = guild.member_count
+        humans = len([m for m in guild.members if not m.bot])
+        bots = len([m for m in guild.members if m.bot])
+        online = len([m for m in guild.members if m.status != discord.Status.offline])
+        
+        embed.add_field(
+            name="members", 
+            value=f"total: {total_members}\nhumans: {humans}\nbots: {bots}\nonline: {online}",
+            inline=True
+        )
+        
+        # Channel statistics
+        text_channels = len(guild.text_channels)
+        voice_channels = len(guild.voice_channels)
+        categories = len(guild.categories)
+        
+        embed.add_field(
+            name="channels",
+            value=f"text: {text_channels}\nvoice: {voice_channels}\ncategories: {categories}",
+            inline=True
+        )
+        
+        # Role statistics
+        total_roles = len(guild.roles)
+        hoisted_roles = len([r for r in guild.roles if r.hoist])
+        mentionable_roles = len([r for r in guild.roles if r.mentionable])
+        
+        embed.add_field(
+            name="roles",
+            value=f"total: {total_roles}\nhoisted: {hoisted_roles}\nmentionable: {mentionable_roles}",
+            inline=True
+        )
+        
+        # Server features
+        features = guild.features
+        notable_features = []
+        if "COMMUNITY" in features:
+            notable_features.append("community")
+        if "VERIFIED" in features:
+            notable_features.append("verified")
+        if "PARTNERED" in features:
+            notable_features.append("partnered")
+        if "DISCOVERABLE" in features:
+            notable_features.append("discoverable")
+            
+        if notable_features:
+            embed.add_field(
+                name="server features",
+                value=", ".join(notable_features),
+                inline=False
+            )
+        
+        # Creation date
+        from datetime import timezone
+        now = datetime.now(timezone.utc)
+        created_days = (now - guild.created_at).days
+        embed.add_field(
+            name="server age",
+            value=f"{created_days} days old\ncreated: {format_timestamp(guild.created_at)}",
+            inline=False
+        )
+        
+        embed.set_thumbnail(url=guild.icon.url if guild.icon else None)
+        await ctx.send(embed=embed, ephemeral=True)
+    
+    @commands.hybrid_command(name="activity")
+    @app_commands.describe() 
+    @app_commands.describe(
+        days="number of days to analyze (1-30, default: 7)"
+    )
+    @is_mod_or_higher()
+    async def activity_stats(self, ctx, days: int = 7):
+        """analyze server activity over time"""
+        if days < 1 or days > 30:
+            await ctx.send(embed=create_error_embed("days must be between 1 and 30"), ephemeral=True)
+            return
+        
+        # Get moderation logs for activity analysis
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            cursor = await db.execute("""
+                SELECT action, timestamp FROM moderation_logs 
+                WHERE guild_id = ? AND timestamp > datetime('now', '-{} days')
+                ORDER BY timestamp DESC
+            """.format(days), (ctx.guild.id,))
+            mod_logs = await cursor.fetchall()
+        
+        embed = create_embed(
+            title=f"📈 activity analysis ({days} days)",
+            color=0x9B59B6
+        )
+        
+        if mod_logs:
+            # Count actions by type
+            action_counts = Counter([log[0] for log in mod_logs])
+            
+            activity_text = []
+            for action, count in action_counts.most_common(5):
+                activity_text.append(f"{action}: {count}")
+            
+            embed.add_field(
+                name="moderation actions",
+                value="\n".join(activity_text) or "no actions",
+                inline=False
+            )
+        else:
+            embed.add_field(
+                name="moderation actions",
+                value="no actions recorded",
+                inline=False
+            )
+        
+        # Member activity (based on recent joins)
+        from datetime import timezone
+        now_utc = datetime.now(timezone.utc)
+        recent_joins = [m for m in ctx.guild.members if m.joined_at and (now_utc - m.joined_at).days <= days]
+        embed.add_field(
+            name="new members",
+            value=f"{len(recent_joins)} joined in last {days} days",
+            inline=True
+        )
+        
+        await ctx.send(embed=embed, ephemeral=True)
+
+async def setup(bot):
+    await bot.add_cog(Analytics(bot))
