@@ -1,0 +1,3119 @@
+# Removing timeout columns from the automod settings queries in multiple views.
+import discord
+from discord.ext import commands, tasks
+from discord import app_commands
+from utils import *
+from db import *
+import re
+import asyncio
+from collections import defaultdict, deque
+from datetime import datetime, timedelta, timezone
+import aiosqlite
+import logging
+import unicodedata
+
+logger = logging.getLogger(__name__)
+DATABASE_PATH = "bot.db"
+
+class AutoModMainView(discord.ui.View):
+    """main automod interface with all features"""
+
+    def __init__(self, guild_id, timeout=300):
+        super().__init__(timeout=timeout)
+        self.guild_id = guild_id
+
+    async def get_automod_settings(self, guild_id):
+        """Get automod settings from database"""
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            # Ensure timeout columns exist
+            timeout_columns = [
+                ('antispam_timeout', 'INTEGER DEFAULT 600'),
+                ('antilink_timeout', 'INTEGER DEFAULT 600'),
+                ('antiinvite_timeout', 'INTEGER DEFAULT 600'),
+                ('word_filter_timeout', 'INTEGER DEFAULT 600'),
+                ('word_filter_punishment', 'TEXT DEFAULT "delete"'),
+                ('multiline_enabled', 'INTEGER DEFAULT 0'),
+                ('multiline_max_lines', 'INTEGER DEFAULT 10'),
+                ('multiline_punishment', 'TEXT DEFAULT "delete"'),
+                ('multiline_timeout', 'INTEGER DEFAULT 600')
+            ]
+
+            for column_name, column_type in timeout_columns:
+                try:
+                    await db.execute(f"ALTER TABLE automod_settings ADD COLUMN {column_name} {column_type}")
+                except:
+                    pass  # Column already exists
+
+            await db.commit()
+
+            cursor = await db.execute("""
+                SELECT antispam_enabled, antispam_threshold, antispam_timeframe, antispam_punishment, 
+                       antispam_timeout,
+                       antilink_enabled, antilink_punishment, 
+                       antilink_timeout,
+                       antiinvite_enabled, antiinvite_punishment, 
+                       antiinvite_timeout,
+                       exempt_channels, exempt_roles, log_channel, blocked_words, word_filter,
+                       word_filter_timeout,
+                       word_filter_punishment,
+                       COALESCE(antispam_exempt_channels, '') as antispam_exempt_channels,
+                       COALESCE(antispam_exempt_roles, '') as antispam_exempt_roles,
+                       COALESCE(antilink_exempt_channels, '') as antilink_exempt_channels,
+                       COALESCE(antilink_exempt_roles, '') as antilink_exempt_roles,
+                       COALESCE(antiinvite_exempt_channels, '') as antiinvite_exempt_channels,
+                       COALESCE(antiinvite_exempt_roles, '') as antiinvite_exempt_roles,
+                       COALESCE(word_filter_exempt_channels, '') as word_filter_exempt_channels,
+                       COALESCE(word_filter_exempt_roles, '') as word_filter_exempt_roles,
+                       COALESCE(multiline_enabled, 0) as multiline_enabled,
+                       COALESCE(multiline_max_lines, 10) as multiline_max_lines,
+                       COALESCE(multiline_punishment, 'delete') as multiline_punishment,
+                       COALESCE(multiline_timeout, 600) as multiline_timeout
+                FROM automod_settings WHERE guild_id = ?
+            """, (guild_id,))
+            row = await cursor.fetchone()
+
+            if row:
+                exempt_channels = [ch.strip() for ch in row[11].split(',') if ch.strip().isdigit()] if row[11] else []
+                exempt_roles = [role.strip() for role in row[12].split(',') if role.strip().isdigit()] if row[12] else []
+                blocked_words = [word.strip() for word in row[14].split(',') if word.strip()] if row[14] else []
+
+                # Parse module-specific exemptions
+                antispam_exempt_channels = [ch.strip() for ch in (row[18] or '').split(',') if ch.strip()]
+                antispam_exempt_roles = [role.strip() for role in (row[19] or '').split(',') if role.strip()]
+                antilink_exempt_channels = [ch.strip() for ch in (row[20] or '').split(',') if ch.strip()]
+                antilink_exempt_roles = [role.strip() for role in (row[21] or '').split(',') if role.strip()]
+                antiinvite_exempt_channels = [ch.strip() for ch in (row[22] or '').split(',') if ch.strip()]
+                antiinvite_exempt_roles = [role.strip() for role in (row[23] or '').split(',') if role.strip()]
+                word_filter_exempt_channels = [ch.strip() for ch in (row[24] or '').split(',') if ch.strip()]
+                word_filter_exempt_roles = [role.strip() for role in (row[25] or '').split(',') if role.strip()]
+
+                return {
+                    'antispam_enabled': bool(row[0]),
+                    'antispam_threshold': row[1] or 5,
+                    'antispam_timeframe': row[2] or 10,
+                    'antispam_punishment': row[3] or 'timeout',
+                    'antispam_timeout': int(row[4]) if row[4] is not None else 600,
+                    'antilink_enabled': bool(row[5]),
+                    'antilink_punishment': row[6] or 'delete',
+                    'antilink_timeout': int(row[7]) if row[7] is not None else 600,
+                    'antiinvite_enabled': bool(row[8]),
+                    'antiinvite_punishment': row[9] or 'delete',
+                    'antiinvite_timeout': int(row[10]) if row[10] is not None else 600,
+                    'exempt_channels': exempt_channels,
+                    'exempt_roles': exempt_roles,
+                    'log_channel': row[13],
+                    'blocked_words': blocked_words,
+                    'word_filter': bool(row[15]),
+                    'word_filter_timeout': int(row[16]) if row[16] is not None else 600,
+                    'word_filter_punishment': row[17] or 'delete',
+                    'antispam_exempt_channels': antispam_exempt_channels,
+                    'antispam_exempt_roles': antispam_exempt_roles,
+                    'antilink_exempt_channels': antilink_exempt_channels,
+                    'antilink_exempt_roles': antilink_exempt_roles,
+                    'antiinvite_exempt_channels': antiinvite_exempt_channels,
+                    'antiinvite_exempt_roles': antiinvite_exempt_roles,
+                    'word_filter_exempt_channels': word_filter_exempt_channels,
+                    'word_filter_exempt_roles': word_filter_exempt_roles,
+                    'multiline_enabled': bool(row[26]),
+                    'multiline_max_lines': row[27] or 10,
+                    'multiline_punishment': row[28] or 'delete',
+                    'multiline_timeout': int(row[29]) if row[29] is not None else 600
+                }
+            else:
+                # Initialize default settings in database when none exist
+                await db.execute("""
+                    INSERT OR IGNORE INTO automod_settings 
+                    (guild_id, antispam_enabled, antispam_threshold, antispam_timeframe, antispam_punishment, antispam_timeout,
+                     antilink_enabled, antilink_punishment, antilink_timeout,
+                     antiinvite_enabled, antiinvite_punishment, antiinvite_timeout,
+                     exempt_channels, exempt_roles, blocked_words, word_filter, word_filter_timeout, word_filter_punishment,
+                     antispam_exempt_channels, antispam_exempt_roles,
+                     antilink_exempt_channels, antilink_exempt_roles,
+                     antiinvite_exempt_channels, antiinvite_exempt_roles,
+                     word_filter_exempt_channels, word_filter_exempt_roles,
+                     multiline_enabled, multiline_max_lines, multiline_punishment, multiline_timeout)
+                    VALUES (?, 0, 5, 10, 'timeout', 600, 0, 'delete', 600, 0, 'delete', 600, '', '', '', 0, 600, 'delete',
+                            '', '', '', '', '', '', '', '',
+                            0, 10, 'delete', 600)
+                """, (guild_id,))
+                await db.commit()
+
+                return {
+                    'antispam_enabled': False,
+                    'antispam_threshold': 5,
+                    'antispam_timeframe': 10,
+                    'antispam_punishment': 'timeout',
+                    'antispam_timeout': 600,
+                    'antilink_enabled': False,
+                    'antilink_punishment': 'delete',
+                    'antilink_timeout': 600,
+                    'antiinvite_enabled': False,
+                    'antiinvite_punishment': 'delete',
+                    'antiinvite_timeout': 600,
+                    'exempt_channels': [],
+                    'exempt_roles': [],
+                    'log_channel': None,
+                    'blocked_words': [],
+                    'word_filter': False,
+                    'word_filter_timeout': 600,
+                    'word_filter_punishment': 'delete',
+                    'antispam_exempt_channels': [],
+                    'antispam_exempt_roles': [],
+                    'antilink_exempt_channels': [],
+                    'antilink_exempt_roles': [],
+                    'antiinvite_exempt_channels': [],
+                    'antiinvite_exempt_roles': [],
+                    'word_filter_exempt_channels': [],
+                    'word_filter_exempt_roles': [],
+                    'multiline_enabled': False,
+                    'multiline_max_lines': 10,
+                    'multiline_punishment': 'delete',
+                    'multiline_timeout': 600
+                }
+
+    async def create_main_embed(self):
+        """Create main automod embed"""
+        settings = await self.get_automod_settings(self.guild_id)
+
+        embed = create_embed(
+            title="automod control panel",
+            description="automod system",
+            color=0x3498DB
+        )
+
+        # Module statuses
+        modules = []
+        modules.append(f"**anti-spam**: {'enabled' if settings['antispam_enabled'] else 'disabled'}")
+        modules.append(f"**anti-links**: {'enabled' if settings['antilink_enabled'] else 'disabled'}")
+        modules.append(f"**anti-invites**: {'enabled' if settings['antiinvite_enabled'] else 'disabled'}")
+        modules.append(f"**word filter**: {'enabled' if settings['word_filter'] else 'disabled'}")
+        modules.append(f"**multiline text**: {'enabled' if settings['multiline_enabled'] else 'disabled'}")
+
+
+        embed.add_field(
+            name="module status",
+            value="\n".join(modules),
+            inline=False
+        )
+
+        # Quick stats
+        stats = []
+        stats.append(f"banned words: **{len(settings['blocked_words'])}**")
+        stats.append(f"exempt channels: **{len(settings['exempt_channels'])}**")
+        stats.append(f"exempt roles: **{len(settings['exempt_roles'])}**")
+
+        embed.add_field(
+            name="quick stats",
+            value="\n".join(stats),
+            inline=True
+        )
+
+        # Current settings
+        current = []
+        current.append(f"spam: {settings['antispam_threshold']} msgs/{settings['antispam_timeframe']}s")
+        current.append(f"spam punishment: {settings['antispam_punishment']}")
+        current.append(f"link punishment: {settings['antilink_punishment']}")
+        current.append(f"invite punishment: {settings['antiinvite_punishment']}")
+        current.append(f"multiline: {settings['multiline_max_lines']} lines, {settings['multiline_punishment']}")
+
+
+        embed.add_field(
+            name="current settings",
+            value="\n".join(current),
+            inline=True
+        )
+
+        embed.set_footer(text="use the buttons below to configure automod")
+        return embed
+
+    @discord.ui.button(label="toggle modules", style=discord.ButtonStyle.primary, row=0)
+    async def toggle_modules(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Toggle automod modules"""
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(
+                embed=create_error_embed("you need administrator permissions"), ephemeral=True
+            )
+            return
+
+        view = ModuleToggleView(self.guild_id)
+        embed = await view.create_module_embed()
+        await interaction.response.edit_message(embed=embed, view=view)
+
+    @discord.ui.button(label="word filter", style=discord.ButtonStyle.secondary, row=0)
+    async def word_management(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Manage banned words"""
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(
+                embed=create_error_embed("you need administrator permissions"), ephemeral=True
+            )
+            return
+
+        view = WordManagementView(self.guild_id)
+        embed = await view.create_word_embed()
+        await interaction.response.edit_message(embed=embed, view=view)
+
+    @discord.ui.button(label="thresholds", style=discord.ButtonStyle.secondary, row=0)
+    async def thresholds(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Configure thresholds and punishments"""
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(
+                embed=create_error_embed("you need administrator permissions"), ephemeral=True
+            )
+            return
+
+        view = ThresholdView(self.guild_id)
+        embed = await view.create_threshold_embed()
+        await interaction.response.edit_message(embed=embed, view=view)
+
+    @discord.ui.button(label="exemptions", style=discord.ButtonStyle.secondary, row=1)
+    async def exemptions(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Manage exemptions"""
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(
+                embed=create_error_embed("you need administrator permissions"), ephemeral=True
+            )
+            return
+
+        view = ExemptionMainView(self.guild_id)
+        embed = await view.create_exemption_main_embed()
+        await interaction.response.edit_message(embed=embed, view=view)
+
+    @discord.ui.button(label="logs", style=discord.ButtonStyle.secondary, row=1)
+    async def logs(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """View automod logs"""
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(
+                embed=create_error_embed("you need administrator permissions"), ephemeral=True
+            )
+            return
+
+        view = LogsView(self.guild_id)
+        embed = await view.create_logs_embed()
+        await interaction.response.edit_message(embed=embed, view=view)
+
+    @discord.ui.button(label="refresh", style=discord.ButtonStyle.success, row=1)
+    async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Refresh the main panel"""
+        embed = await self.create_main_embed()
+        await interaction.response.edit_message(embed=embed, view=self)
+
+class ModuleToggleView(discord.ui.View):
+    """Module toggle interface"""
+
+    def __init__(self, guild_id, timeout=300):
+        super().__init__(timeout=timeout)
+        self.guild_id = guild_id
+
+    async def get_automod_settings(self, guild_id):
+        """Get automod settings from database"""
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            cursor = await db.execute("""
+                SELECT antispam_enabled, antilink_enabled, antiinvite_enabled, word_filter, COALESCE(multiline_enabled, 0) as multiline_enabled
+                FROM automod_settings WHERE guild_id = ?
+            """, (guild_id,))
+            row = await cursor.fetchone()
+
+            if row:
+                return {
+                    'antispam_enabled': bool(row[0]),
+                    'antilink_enabled': bool(row[1]),
+                    'antiinvite_enabled': bool(row[2]),
+                    'word_filter': bool(row[3]),
+                    'multiline_enabled': bool(row[4])
+                }
+            else:
+                return {
+                    'antispam_enabled': False,
+                    'antilink_enabled': False,
+                    'antiinvite_enabled': False,
+                    'word_filter': False,
+                    'multiline_enabled': False
+                }
+
+    async def create_module_embed(self):
+        """Create module toggle embed"""
+        settings = await self.get_automod_settings(self.guild_id)
+
+        embed = create_embed(
+            title="module toggles",
+            description="enable or disable automod modules",
+            color=0x2ECC71
+        )
+
+        modules = []
+        modules.append(f"**anti-spam**: {'enabled' if settings['antispam_enabled'] else 'disabled'}")
+        modules.append(f"**anti-links**: {'enabled' if settings['antilink_enabled'] else 'disabled'}")
+        modules.append(f"**anti-invites**: {'enabled' if settings['antiinvite_enabled'] else 'disabled'}")
+        modules.append(f"**word filter**: {'enabled' if settings['word_filter'] else 'disabled'}")
+        modules.append(f"**multiline text**: {'enabled' if settings['multiline_enabled'] else 'disabled'}")
+
+        embed.add_field(
+            name="current status",
+            value="\n".join(modules),
+            inline=False
+        )
+
+        return embed
+
+    @discord.ui.button(label="anti-spam", style=discord.ButtonStyle.secondary, row=0)
+    async def toggle_antispam(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Toggle anti-spam module"""
+        settings = await self.get_automod_settings(self.guild_id)
+        new_state = not settings['antispam_enabled']
+
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            await db.execute("""
+                INSERT INTO automod_settings (guild_id, antispam_enabled) 
+                VALUES (?, ?)
+                ON CONFLICT(guild_id) DO UPDATE SET antispam_enabled = excluded.antispam_enabled
+            """, (self.guild_id, new_state))
+            await db.commit()
+
+        embed = await self.create_module_embed()
+        embed.add_field(
+            name="updated",
+            value=f"anti-spam: {'enabled' if new_state else 'disabled'}",
+            inline=False
+        )
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="anti-links", style=discord.ButtonStyle.secondary, row=0)
+    async def toggle_antilink(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Toggle anti-link module"""
+        settings = await self.get_automod_settings(self.guild_id)
+        new_state = not settings['antilink_enabled']
+
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            await db.execute("""
+                INSERT INTO automod_settings (guild_id, antilink_enabled) 
+                VALUES (?, ?)
+                ON CONFLICT(guild_id) DO UPDATE SET antilink_enabled = excluded.antilink_enabled
+            """, (self.guild_id, new_state))
+            await db.commit()
+
+        embed = await self.create_module_embed()
+        embed.add_field(
+            name="updated",
+            value=f"anti-links: {'enabled' if new_state else 'disabled'}",
+            inline=False
+        )
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="anti-invites", style=discord.ButtonStyle.secondary, row=0)
+    async def toggle_antiinvite(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Toggle anti-invite module"""
+        settings = await self.get_automod_settings(self.guild_id)
+        new_state = not settings['antiinvite_enabled']
+
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            await db.execute("""
+                INSERT INTO automod_settings (guild_id, antiinvite_enabled) 
+                VALUES (?, ?)
+                ON CONFLICT(guild_id) DO UPDATE SET antiinvite_enabled = excluded.antiinvite_enabled
+            """, (self.guild_id, new_state))
+            await db.commit()
+
+        embed = await self.create_module_embed()
+        embed.add_field(
+            name="updated",
+            value=f"anti-invites: {'enabled' if new_state else 'disabled'}",
+            inline=False
+        )
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="word filter", style=discord.ButtonStyle.secondary, row=0)
+    async def toggle_wordfilter(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Toggle word filter module"""
+        settings = await self.get_automod_settings(self.guild_id)
+        new_state = not settings['word_filter']
+
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            await db.execute("""
+                INSERT INTO automod_settings (guild_id, word_filter) 
+                VALUES (?, ?)
+                ON CONFLICT(guild_id) DO UPDATE SET word_filter = excluded.word_filter
+            """, (self.guild_id, new_state))
+            await db.commit()
+
+        embed = await self.create_module_embed()
+        embed.add_field(
+            name="updated",
+            value=f"word filter: {'enabled' if new_state else 'disabled'}",
+            inline=False
+        )
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="multiline", style=discord.ButtonStyle.secondary, row=0)
+    async def toggle_multiline(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Toggle multiline filter module"""
+        settings = await self.get_automod_settings(self.guild_id)
+        new_state = not settings['multiline_enabled']
+
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            await db.execute("""
+                INSERT INTO automod_settings (guild_id, multiline_enabled) 
+                VALUES (?, ?)
+                ON CONFLICT(guild_id) DO UPDATE SET multiline_enabled = excluded.multiline_enabled
+            """, (self.guild_id, new_state))
+            await db.commit()
+
+        embed = await self.create_module_embed()
+        embed.add_field(
+            name="updated",
+            value=f"multiline text: {'enabled' if new_state else 'disabled'}",
+            inline=False
+        )
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="â back", style=discord.ButtonStyle.primary, row=1)
+    async def back_to_main(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Go back to main panel"""
+        view = AutoModMainView(self.guild_id)
+        embed = await view.create_main_embed()
+        await interaction.response.edit_message(embed=embed, view=view)
+
+class WordManagementView(discord.ui.View):
+    """word filter interface"""
+
+    def __init__(self, guild_id, timeout=300):
+        super().__init__(timeout=timeout)
+        self.guild_id = guild_id
+
+    async def get_blocked_words(self):
+        """Get blocked words from database"""
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            cursor = await db.execute("SELECT blocked_words FROM automod_settings WHERE guild_id = ?", (self.guild_id,))
+            result = await cursor.fetchone()
+            if result and result[0]:
+                return result[0].split(',')
+            return []
+
+    async def create_word_embed(self):
+        """create word filter embed"""
+        words = await self.get_blocked_words()
+
+        embed = create_embed(
+            title="word filter",
+            description="manage banned words and regex patterns",
+            color=0xE74C3C
+        )
+
+        if words:
+            # Split words into regular and regex
+            regular_words = []
+            regex_patterns = []
+
+            for word in words[:20]:  # Show max 20
+                if word.startswith('/') and word.endswith('/'):
+                    regex_patterns.append(f"`{word}`")
+                else:
+                    regular_words.append(f"`{word}`")
+
+            if regular_words:
+                embed.add_field(
+                    name=f"ð¤ words ({len([w for w in words if not (w.startswith('/') and w.endswith('/'))])}",
+                    value=", ".join(regular_words[:10]) + ("..." if len(regular_words) > 10 else ""),
+                    inline=False
+                )
+
+            if regex_patterns:
+                embed.add_field(
+                    name=f"ð regex patterns ({len([w for w in words if w.startswith('/') and w.endswith('/')])}",
+                    value=", ".join(regex_patterns[:5]) + ("..." if len(regex_patterns) > 5 else ""),
+                    inline=False
+                )
+        else:
+            embed.add_field(
+                name="ð no banned words",
+                value="use the buttons below to add words or regex patterns",
+                inline=False
+            )
+
+        embed.add_field(
+            name="ð¡ tips",
+            value="â¢ regex patterns should be wrapped in `/pattern/`\nâ¢ example: `/f[u4]ck/` matches fuck, f4ck, fuuck\nâ¢ use **import file** to upload multiple patterns from .txt",
+            inline=False
+        )
+
+        return embed
+
+    @discord.ui.button(label="add word", style=discord.ButtonStyle.success, row=0)
+    async def add_word(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Add a word"""
+        modal = AddWordModal(self.guild_id, "word")
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="add regex", style=discord.ButtonStyle.success, row=0)
+    async def add_regex(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Add a regex pattern"""
+        modal = AddWordModal(self.guild_id, "regex")
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="remove word", style=discord.ButtonStyle.danger, row=0)
+    async def remove_word(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Remove a word"""
+        modal = RemoveWordModal(self.guild_id)
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="list all", style=discord.ButtonStyle.secondary, row=1)
+    async def list_all(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """List all words"""
+        words = await self.get_blocked_words()
+
+        if not words:
+            await interaction.response.send_message(
+                embed=create_error_embed("no banned words found"), ephemeral=True
+            )
+            return
+
+        # Create paginated list
+        embed = create_embed(
+            title="ð all banned words",
+            description=f"total: {len(words)} words/patterns",
+            color=0x95A5A6
+        )
+
+        regular_words = [w for w in words if not (w.startswith('/') and w.endswith('/'))]
+        regex_patterns = [w for w in words if w.startswith('/') and w.endswith('/')]
+
+        if regular_words:
+            words_text = ", ".join(f"`{w}`" for w in regular_words[:50])
+            if len(regular_words) > 50:
+                words_text += f"\n... and {len(regular_words) - 50} more"
+            embed.add_field(name=f"ð¤ words ({len(regular_words)})", value=words_text, inline=False)
+
+        if regex_patterns:
+            regex_text = ", ".join(f"`{p}`" for p in regex_patterns[:20])
+            if len(regex_patterns) > 20:
+                regex_text += f"\n... and {len(regex_patterns) - 20} more"
+            embed.add_field(name=f"ð regex ({len(regex_patterns)})", value=regex_text, inline=False)
+
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="import file", style=discord.ButtonStyle.secondary, row=1)
+    async def import_file(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Import regex patterns from file"""
+        modal = ImportFileModal(self.guild_id)
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="clear all", style=discord.ButtonStyle.danger, row=1)
+    async def clear_all(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Clear all words"""
+        view = ConfirmClearView(self.guild_id)
+        embed = create_embed(
+            title="â ï¸ confirm clear all",
+            description="are you sure you want to remove all banned words?\nthis action cannot be undone!",
+            color=0xE74C3C
+        )
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+    @discord.ui.button(label="â back", style=discord.ButtonStyle.primary, row=2)
+    async def back_to_main(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Go back to main panel"""
+        view = AutoModMainView(self.guild_id)
+        embed = await view.create_main_embed()
+        await interaction.response.edit_message(embed=embed, view=view)
+
+class ThresholdView(discord.ui.View):
+    """Threshold configuration interface"""
+
+    def __init__(self, guild_id, timeout=300):
+        super().__init__(timeout=timeout)
+        self.guild_id = guild_id
+
+    async def get_settings(self):
+        """Get threshold settings"""
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            # Ensure timeout columns exist
+            timeout_columns = [
+                ('antispam_timeout', 'INTEGER DEFAULT 600'),
+                ('antilink_timeout', 'INTEGER DEFAULT 600'),
+                ('antiinvite_timeout', 'INTEGER DEFAULT 600'),
+                ('word_filter_timeout', 'INTEGER DEFAULT 600'),
+                ('word_filter_punishment', 'TEXT DEFAULT "delete"'),
+                ('multiline_enabled', 'INTEGER DEFAULT 0'),
+                ('multiline_max_lines', 'INTEGER DEFAULT 10'),
+                ('multiline_punishment', 'TEXT DEFAULT "delete"'),
+                ('multiline_timeout', 'INTEGER DEFAULT 600')
+            ]
+
+            for column_name, column_type in timeout_columns:
+                try:
+                    await db.execute(f"ALTER TABLE automod_settings ADD COLUMN {column_name} {column_type}")
+                except:
+                    pass  # Column already exists
+
+            await db.commit()
+
+            cursor = await db.execute("""
+                SELECT antispam_threshold, antispam_timeframe, antispam_punishment,
+                       antispam_timeout,
+                       antilink_punishment, 
+                       antilink_timeout,
+                       antiinvite_punishment,
+                       antiinvite_timeout,
+                       word_filter_punishment,
+                       word_filter_timeout,
+                       COALESCE(multiline_enabled, 0) as multiline_enabled,
+                       COALESCE(multiline_max_lines, 10) as multiline_max_lines,
+                       COALESCE(multiline_punishment, 'delete') as multiline_punishment,
+                       COALESCE(multiline_timeout, 600) as multiline_timeout
+                FROM automod_settings WHERE guild_id = ?
+            """, (self.guild_id,))
+            row = await cursor.fetchone()
+
+            if row:
+                return {
+                    'antispam_threshold': row[0] or 5,
+                    'antispam_timeframe': row[1] or 10,
+                    'antispam_punishment': row[2] or 'timeout',
+                    'antispam_timeout': int(row[3]) if row[3] is not None else 600,
+                    'antilink_punishment': row[4] or 'delete',
+                    'antilink_timeout': int(row[5]) if row[5] is not None else 600,
+                    'antiinvite_punishment': row[6] or 'delete',
+                    'antiinvite_timeout': int(row[7]) if row[7] is not None else 600,
+                    'word_filter_punishment': row[8] or 'delete',
+                    'word_filter_timeout': int(row[9]) if row[9] is not None else 600,
+                    'multiline_enabled': bool(row[10]),
+                    'multiline_max_lines': row[11] or 10,
+                    'multiline_punishment': row[12] or 'delete',
+                    'multiline_timeout': int(row[13]) if row[13] is not None else 600
+                }
+            else:
+                # Initialize default settings in database when none exist
+                await db.execute("""
+                    INSERT OR IGNORE INTO automod_settings 
+                    (guild_id, antispam_enabled, antispam_threshold, antispam_timeframe, antispam_punishment, antispam_timeout,
+                     antilink_enabled, antilink_punishment, antilink_timeout,
+                     antiinvite_enabled, antiinvite_punishment, antiinvite_timeout,
+                     exempt_channels, exempt_roles, blocked_words, word_filter, word_filter_timeout, word_filter_punishment,
+                     multiline_enabled, multiline_max_lines, multiline_punishment, multiline_timeout)
+                    VALUES (?, 0, 5, 10, 'timeout', 600, 0, 'delete', 600, 0, 'delete', 600, '', '', '', 0, 600, 'delete',
+                            0, 10, 'delete', 600)
+                """, (self.guild_id,))
+                await db.commit()
+
+                return {
+                    'antispam_threshold': 5,
+                    'antispam_timeframe': 10,
+                    'antispam_punishment': 'timeout',
+                    'antispam_timeout': 600,
+                    'antilink_punishment': 'delete',
+                    'antilink_timeout': 600,
+                    'antiinvite_punishment': 'delete',
+                    'antiinvite_timeout': 600,
+                    'word_filter_punishment': 'delete',
+                    'word_filter_timeout': 600,
+                    'multiline_enabled': False,
+                    'multiline_max_lines': 10,
+                    'multiline_punishment': 'delete',
+                    'multiline_timeout': 600
+                }
+
+    async def create_threshold_embed(self):
+        """Create threshold configuration embed"""
+        settings = await self.get_settings()
+
+        embed = create_embed(
+            title="ð threshold configuration",
+            description="configure detection thresholds and punishments",
+            color=0xF39C12
+        )
+
+        # Format punishment strings for display
+        spam_punishments = settings['antispam_punishment'].replace(',', ' â ')
+        link_punishments = settings['antilink_punishment'].replace(',', ' â ')
+        invite_punishments = settings['antiinvite_punishment'].replace(',', ' â ')
+        word_filter_punishments = settings['word_filter_punishment'].replace(',', ' â ')
+        multiline_punishments = settings['multiline_punishment'].replace(',', ' â ')
+
+
+        embed.add_field(
+            name="ð« anti-spam settings",
+            value=f"threshold: **{settings['antispam_threshold']} messages**\ntimeframe: **{settings['antispam_timeframe']} seconds**\npunishments: **{spam_punishments}**\ntimeout: **{settings['antispam_timeout']}s**",
+            inline=True
+        )
+
+        embed.add_field(
+            name="ð anti-link punishments",
+            value=f"**{link_punishments}**\ntimeout: **{settings['antilink_timeout']}s**",
+            inline=True
+        )
+
+        embed.add_field(
+            name="ð¨ anti-invite punishments",
+            value=f"**{invite_punishments}**\ntimeout: **{settings['antiinvite_timeout']}s**",
+            inline=True
+        )
+
+        # Format word filter punishments
+        embed.add_field(
+            name="ð¤ word filter punishments",
+            value=f"**{word_filter_punishments}**\ntimeout: **{settings['word_filter_timeout']}s**",
+            inline=True
+        )
+        
+        embed.add_field(
+            name="ð¤ multiline text settings",
+            value=f"max lines: **{settings['multiline_max_lines']}**\npunishment: **{multiline_punishments}**\ntimeout: **{settings['multiline_timeout']}s**",
+            inline=True
+        )
+
+
+        embed.add_field(
+            name="ð¡ punishment types",
+            value="`delete` - delete message only\n`timeout` - timeout user\n`kick` - kick user\n`ban` - ban user\n`warn` - warn user\n\n**multiple punishments:** separate with commas (e.g., `delete,timeout,warn`)",
+            inline=False
+        )
+
+        return embed
+
+    @discord.ui.button(label="spam config", style=discord.ButtonStyle.secondary, row=0)
+    async def spam_config(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Configure spam settings"""
+        modal = SpamConfigModal(self.guild_id)
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="link punishment", style=discord.ButtonStyle.secondary, row=0)
+    async def link_punishment(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Configure link punishment"""
+        modal = PunishmentModal(self.guild_id, "antilink")
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="invite punishment", style=discord.ButtonStyle.secondary, row=0)
+    async def invite_punishment(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Configure invite punishment"""
+        modal = PunishmentModal(self.guild_id, "antiinvite")
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="word filter punishment", style=discord.ButtonStyle.secondary, emoji="ð¤", row=1)
+    async def word_filter_punishment(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Configure word filter punishment"""
+        modal = PunishmentModal(self.guild_id, "word_filter")
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="multiline config", style=discord.ButtonStyle.secondary, emoji="ð¤", row=1)
+    async def multiline_config(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Configure multiline punishment"""
+        modal = MultilineConfigModal(self.guild_id)
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="â back", style=discord.ButtonStyle.primary, row=2)
+    async def back_to_main(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Go back to main panel"""
+        view = AutoModMainView(self.guild_id)
+        embed = await view.create_main_embed()
+        await interaction.response.edit_message(embed=embed, view=view)
+
+
+class LogsView(discord.ui.View):
+    """Logs interface"""
+
+    def __init__(self, guild_id, timeout=300):
+        super().__init__(timeout=timeout)
+        self.guild_id = guild_id
+
+    async def create_logs_embed(self):
+        """Create logs embed"""
+        # Get recent automod actions from database
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            cursor = await db.execute("""
+                SELECT user_id, action_type, timestamp, punishment, details
+                FROM automod_logs WHERE guild_id = ? 
+                ORDER BY timestamp DESC LIMIT 20
+            """, (self.guild_id,))
+            logs = await cursor.fetchall()
+
+        embed = create_embed(
+            title="ð automod logs",
+            description="recent automod actions",
+            color=0x34495E
+        )
+
+        if logs:
+            log_text = []
+            for log in logs[:10]:
+                user_id, action_type, timestamp, punishment, details = log
+                time_str = timestamp[:16] if timestamp else "unknown"
+                # Truncate long punishment text to prevent field overflow
+                punishment_text = punishment[:50] + "..." if len(punishment) > 50 else punishment
+                log_entry = f"`{time_str}` <@{user_id}> - {action_type} â {punishment_text}"
+                log_text.append(log_entry)
+
+            # Join log entries and ensure total doesn't exceed 1024 characters
+            full_log_text = "\n".join(log_text)
+            if len(full_log_text) > 1000:  # Leave some buffer
+                # Truncate to fit within Discord's limit
+                truncated_logs = []
+                current_length = 0
+                for log_entry in log_text:
+                    if current_length + len(log_entry) + 1 > 950:  # Leave space for "... and X more"
+                        remaining = len(log_text) - len(truncated_logs)
+                        truncated_logs.append(f"... and {remaining} more actions")
+                        break
+                    truncated_logs.append(log_entry)
+                    current_length += len(log_entry) + 1
+                full_log_text = "\n".join(truncated_logs)
+
+            embed.add_field(
+                name=f"recent actions ({len(logs)} total)",
+                value=full_log_text,
+                inline=False
+            )
+        else:
+            embed.add_field(
+                name="no recent actions",
+                value="no automod actions recorded yet",
+                inline=False
+            )
+
+        # Get log channel setting
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            cursor = await db.execute("SELECT log_channel FROM automod_settings WHERE guild_id = ?", (self.guild_id,))
+            result = await cursor.fetchone()
+            log_channel = result[0] if result else None
+
+        if log_channel:
+            embed.add_field(
+                name="ðº log channel",
+                value=f"<#{log_channel}>",
+                inline=True
+            )
+        else:
+            embed.add_field(
+                name="ðº log channel",
+                value="not configured",
+                inline=True
+            )
+
+        return embed
+
+    @discord.ui.button(label="set log channel", style=discord.ButtonStyle.secondary, emoji="ðº", row=0)
+    async def set_log_channel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Set log channel"""
+        modal = LogChannelModal(self.guild_id)
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="clear logs", style=discord.ButtonStyle.danger, emoji="ð§¹", row=0)
+    async def clear_logs(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Clear all logs"""
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            await db.execute("DELETE FROM automod_logs WHERE guild_id = ?", (self.guild_id,))
+            await db.commit()
+
+        embed = create_success_embed("cleared all automod logs")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="â back", style=discord.ButtonStyle.primary, row=1)
+    async def back_to_main(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Go back to main panel"""
+        view = AutoModMainView(self.guild_id)
+        embed = await view.create_main_embed()
+        await interaction.response.edit_message(embed=embed, view=view)
+
+# Modal classes
+class AddWordModal(discord.ui.Modal):
+    """Modal for adding words/regex"""
+
+    def __init__(self, guild_id, word_type):
+        super().__init__(title=f"add {word_type}")
+        self.guild_id = guild_id
+        self.word_type = word_type
+
+        self.word_input = discord.ui.TextInput(
+            label=f"{word_type} to ban",
+            placeholder="word" if word_type == "word" else "/regex pattern/",
+            max_length=100
+        )
+        self.add_item(self.word_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        word = self.word_input.value.strip()
+
+        if not word:
+            await interaction.response.send_message(
+                embed=create_error_embed("word cannot be empty"), ephemeral=True
+            )
+            return
+
+        if self.word_type == "regex" and not (word.startswith('/') and word.endswith('/')):
+            word = f"/{word}/"
+
+        # Validate regex pattern if it's a regex
+        if word.startswith('/') and word.endswith('/'):
+            pattern = word[1:-1]
+            try:
+                re.compile(pattern)
+            except re.error as e:
+                await interaction.response.send_message(
+                    embed=create_error_embed(f"invalid regex pattern: {e}"), ephemeral=True
+                )
+                return
+
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            # Get current settings
+            cursor = await db.execute("SELECT blocked_words FROM automod_settings WHERE guild_id = ?", (self.guild_id,))
+            result = await cursor.fetchone()
+
+            current_words = []
+            if result and result[0]:
+                current_words = [w.strip() for w in result[0].split(',') if w.strip()]
+
+            if word in current_words:
+                await interaction.response.send_message(
+                    embed=create_error_embed(f"{self.word_type} already banned"), ephemeral=True
+                )
+                return
+
+            current_words.append(word)
+
+            # Insert or update the record
+            await db.execute("""
+                INSERT INTO automod_settings (guild_id, blocked_words) 
+                VALUES (?, ?)
+                ON CONFLICT(guild_id) DO UPDATE SET blocked_words = excluded.blocked_words
+            """, (self.guild_id, ','.join(current_words)))
+            await db.commit()
+
+        embed = create_success_embed(f"added {self.word_type}: `{word}`")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+class RemoveWordModal(discord.ui.Modal):
+    """Modal for removing words"""
+
+    def __init__(self, guild_id):
+        super().__init__(title="remove word/regex")
+        self.guild_id = guild_id
+
+        self.word_input = discord.ui.TextInput(
+            label="word/regex to remove",
+            placeholder="enter exact word or regex pattern",
+            max_length=100
+        )
+        self.add_item(self.word_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        word = self.word_input.value.strip()
+
+        if not word:
+            await interaction.response.send_message(
+                embed=create_error_embed("word cannot be empty"), ephemeral=True
+            )
+            return
+
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            cursor = await db.execute("SELECT blocked_words FROM automod_settings WHERE guild_id = ?", (self.guild_id,))
+            result = await cursor.fetchone()
+
+            if not result or not result[0]:
+                await interaction.response.send_message(
+                    embed=create_error_embed("no banned words found"), ephemeral=True
+                )
+                return
+
+            current_words = [w.strip() for w in result[0].split(',') if w.strip()]
+
+            if word not in current_words:
+                await interaction.response.send_message(
+                    embed=create_error_embed("word/regex not found"), ephemeral=True
+                )
+                return
+
+            current_words.remove(word)
+
+            await db.execute("""
+                UPDATE automod_settings SET blocked_words = ? WHERE guild_id = ?
+            """, (','.join(current_words), self.guild_id))
+            await db.commit()
+
+        embed = create_success_embed(f"removed: `{word}`")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+class SpamConfigModal(discord.ui.Modal):
+    """Modal for spam configuration with multiple punishments"""
+
+    def __init__(self, guild_id):
+        super().__init__(title="configure spam detection")
+        self.guild_id = guild_id
+
+        self.threshold = discord.ui.TextInput(
+            label="message threshold",
+            placeholder="messages to trigger (2-20)",
+            default="5",
+            max_length=2
+        )
+        self.timeframe = discord.ui.TextInput(
+            label="time window (seconds)",
+            placeholder="time window (5-60)",
+            default="10",
+            max_length=2
+        )
+        self.punishments = discord.ui.TextInput(
+            label="punishments (comma separated)",
+            placeholder="delete,timeout,warn or timeout,kick",
+            default="timeout",
+            max_length=50
+        )
+        self.timeout_duration = discord.ui.TextInput(
+            label="timeout duration (seconds)",
+            placeholder="600 (for timeout punishments only)",
+            default="600",
+            max_length=6,
+            required=False
+        )
+
+        self.add_item(self.threshold)
+        self.add_item(self.timeframe)
+        self.add_item(self.punishments)
+        self.add_item(self.timeout_duration)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            threshold_val = int(self.threshold.value)
+            timeframe_val = int(self.timeframe.value)
+            punishments_input = self.punishments.value.strip()
+            timeout_val = self.timeout_duration.value.strip()
+
+            if threshold_val < 2 or threshold_val > 20:
+                await interaction.response.send_message(
+                    embed=create_error_embed("threshold must be between 2 and 20"), ephemeral=True
+                )
+                return
+
+            if timeframe_val < 5 or timeframe_val > 60:
+                await interaction.response.send_message(
+                    embed=create_error_embed("timeframe must be between 5 and 60 seconds"), ephemeral=True
+                )
+                return
+
+            # Parse and validate punishments
+            punishment_list = [p.strip().lower() for p in punishments_input.split(",") if p.strip()]
+            if not punishment_list:
+                await interaction.response.send_message(
+                    embed=create_error_embed("at least one punishment must be specified"), ephemeral=True
+                )
+                return
+
+            valid_punishments = ['delete', 'timeout', 'kick', 'ban', 'warn']
+            for punishment in punishment_list:
+                if punishment not in valid_punishments:
+                    await interaction.response.send_message(
+                        embed=create_error_embed(f"'{punishment}' is not valid. must be one of: {', '.join(valid_punishments)}"), ephemeral=True
+                    )
+                    return
+
+            # Validate timeout duration if provided
+            timeout_seconds = 600  # default
+            if timeout_val:
+                try:
+                    timeout_seconds = int(timeout_val)
+                    if timeout_seconds < 1 or timeout_seconds > 2419200:  # max 28 days
+                        await interaction.response.send_message(
+                            embed=create_error_embed("timeout duration must be between 1 and 2419200 seconds (28 days)"), ephemeral=True
+                        )
+                        return
+                except ValueError:
+                    await interaction.response.send_message(
+                        embed=create_error_embed("timeout duration must be a valid number"), ephemeral=True
+                    )
+                    return
+
+            punishment_string = ",".join(punishment_list)
+
+            async with aiosqlite.connect(DATABASE_PATH) as db:
+                await db.execute("""
+                    INSERT INTO automod_settings (guild_id, antispam_threshold, antispam_timeframe, antispam_punishment, antispam_timeout)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(guild_id) DO UPDATE SET 
+                    antispam_threshold = excluded.antispam_threshold,
+                    antispam_timeframe = excluded.antispam_timeframe,
+                    antispam_punishment = excluded.antispam_punishment,
+                    antispam_timeout = excluded.antispam_timeout
+                """, (self.guild_id, threshold_val, timeframe_val, punishment_string, timeout_seconds))
+                await db.commit()
+
+            punishment_display = " â ".join(punishment_list)
+            embed = create_success_embed(
+                f"updated spam config: {threshold_val} messages in {timeframe_val}s â {punishment_display} ({timeout_seconds}s timeout)"
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+
+        except ValueError:
+            await interaction.response.send_message(
+                embed=create_error_embed("please enter valid numbers"), ephemeral=True
+            )
+
+class PunishmentModal(discord.ui.Modal):
+    """Modal for punishment configuration with multiple punishment support"""
+
+    def __init__(self, guild_id, module_type):
+        super().__init__(title=f"configure {module_type} punishments")
+        self.guild_id = guild_id
+        self.module_type = module_type
+
+        self.punishment1 = discord.ui.TextInput(
+            label="primary punishment",
+            placeholder="delete, timeout, kick, ban, warn",
+            default="delete",
+            max_length=10
+        )
+        self.punishment2 = discord.ui.TextInput(
+            label="secondary punishment (optional)",
+            placeholder="timeout, kick, ban, warn (leave empty for none)",
+            max_length=10,
+            required=False
+        )
+        self.punishment3 = discord.ui.TextInput(
+            label="tertiary punishment (optional)",
+            placeholder="kick, ban, warn (leave empty for none)",
+            max_length=10,
+            required=False
+        )
+        self.timeout_duration = discord.ui.TextInput(
+            label="timeout duration (seconds)",
+            placeholder="600 (for timeout punishments only)",
+            default="600",
+            max_length=6,
+            required=False
+        )
+
+        self.add_item(self.punishment1)
+        self.add_item(self.punishment2)
+        self.add_item(self.punishment3)
+        self.add_item(self.timeout_duration)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        punishment1_val = self.punishment1.value.lower().strip()
+        punishment2_val = self.punishment2.value.lower().strip() if self.punishment2.value else ""
+        punishment3_val = self.punishment3.value.lower().strip() if self.punishment3.value else ""
+        timeout_val = self.timeout_duration.value.strip()
+
+        valid_punishments = ['delete', 'timeout', 'kick', 'ban', 'warn']
+
+        # Validate all punishments
+        punishments = [punishment1_val]
+        if punishment2_val:
+            punishments.append(punishment2_val)
+        if punishment3_val:
+            punishments.append(punishment3_val)
+
+        for punishment in punishments:
+            if punishment not in valid_punishments:
+                await interaction.response.send_message(
+                    embed=create_error_embed(f"'{punishment}' is not valid. must be one of: {', '.join(valid_punishments)}"), ephemeral=True
+                )
+                return
+
+        # Validate timeout duration if provided
+        timeout_seconds = 600  # default
+        if timeout_val:
+            try:
+                timeout_seconds = int(timeout_val)
+                if timeout_seconds < 1 or timeout_seconds > 2419200:  # max 28 days
+                    await interaction.response.send_message(
+                        embed=create_error_embed("timeout duration must be between 1 and 2419200 seconds (28 days)"), ephemeral=True
+                    )
+                    return
+            except ValueError:
+                await interaction.response.send_message(
+                    embed=create_error_embed("timeout duration must be a valid number"), ephemeral=True
+                )
+                return
+
+        # Store multiple punishments as comma-separated string
+        punishment_string = ",".join(punishments)
+
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            if self.module_type == "antilink":
+                await db.execute("""
+                    INSERT INTO automod_settings (guild_id, antilink_punishment, antilink_timeout) 
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(guild_id) DO UPDATE SET 
+                    antilink_punishment = ?, antilink_timeout = ?
+                """, (self.guild_id, punishment_string, timeout_seconds, punishment_string, timeout_seconds))
+            elif self.module_type == "antiinvite":
+                await db.execute("""
+                    INSERT INTO automod_settings (guild_id, antiinvite_punishment, antiinvite_timeout) 
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(guild_id) DO UPDATE SET 
+                    antiinvite_punishment = ?, antiinvite_timeout = ?
+                """, (self.guild_id, punishment_string, timeout_seconds, punishment_string, timeout_seconds))
+            elif self.module_type == "word_filter":
+                await db.execute("""
+                    INSERT INTO automod_settings (guild_id, word_filter_punishment, word_filter_timeout) 
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(guild_id) DO UPDATE SET 
+                    word_filter_punishment = ?, word_filter_timeout = ?
+                """, (self.guild_id, punishment_string, timeout_seconds, punishment_string, timeout_seconds))
+            await db.commit()
+
+        punishment_display = " â ".join(punishments)
+        embed = create_success_embed(f"updated {self.module_type} punishments: {punishment_display} ({timeout_seconds}s timeout)")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+class MultilineConfigModal(discord.ui.Modal):
+    """Modal for multiline configuration with multiple punishment support"""
+
+    def __init__(self, guild_id):
+        super().__init__(title="configure multiline text")
+        self.guild_id = guild_id
+
+        self.max_lines = discord.ui.TextInput(
+            label="maximum lines",
+            placeholder="enter the maximum number of lines allowed (e.g., 10)",
+            default="10",
+            max_length=3
+        )
+        self.punishment1 = discord.ui.TextInput(
+            label="primary punishment",
+            placeholder="delete, timeout, kick, ban, warn",
+            default="delete",
+            max_length=10
+        )
+        self.punishment2 = discord.ui.TextInput(
+            label="secondary punishment (optional)",
+            placeholder="timeout, kick, ban, warn (leave empty for none)",
+            max_length=10,
+            required=False
+        )
+        self.punishment3 = discord.ui.TextInput(
+            label="tertiary punishment (optional)",
+            placeholder="kick, ban, warn (leave empty for none)",
+            max_length=10,
+            required=False
+        )
+        self.timeout_duration = discord.ui.TextInput(
+            label="timeout duration (seconds)",
+            placeholder="600 (for timeout punishments only)",
+            default="600",
+            max_length=6,
+            required=False
+        )
+
+        self.add_item(self.max_lines)
+        self.add_item(self.punishment1)
+        self.add_item(self.punishment2)
+        self.add_item(self.punishment3)
+        self.add_item(self.timeout_duration)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            max_lines_val = int(self.max_lines.value)
+            punishment1_val = self.punishment1.value.lower().strip()
+            punishment2_val = self.punishment2.value.lower().strip() if self.punishment2.value else ""
+            punishment3_val = self.punishment3.value.lower().strip() if self.punishment3.value else ""
+            timeout_val = self.timeout_duration.value.strip()
+
+            if max_lines_val < 1 or max_lines_val > 50:
+                await interaction.response.send_message(
+                    embed=create_error_embed("maximum lines must be between 1 and 50"), ephemeral=True
+                )
+                return
+
+            valid_punishments = ['delete', 'timeout', 'kick', 'ban', 'warn']
+
+            # Validate all punishments
+            punishments = [punishment1_val]
+            if punishment2_val:
+                punishments.append(punishment2_val)
+            if punishment3_val:
+                punishments.append(punishment3_val)
+
+            for punishment in punishments:
+                if punishment not in valid_punishments:
+                    await interaction.response.send_message(
+                        embed=create_error_embed(f"'{punishment}' is not valid. must be one of: {', '.join(valid_punishments)}"), ephemeral=True
+                    )
+                    return
+
+            # Validate timeout duration if provided
+            timeout_seconds = 600  # default
+            if timeout_val:
+                try:
+                    timeout_seconds = int(timeout_val)
+                    if timeout_seconds < 1 or timeout_seconds > 2419200:  # max 28 days
+                        await interaction.response.send_message(
+                            embed=create_error_embed("timeout duration must be between 1 and 2419200 seconds (28 days)"), ephemeral=True
+                        )
+                        return
+                except ValueError:
+                    await interaction.response.send_message(
+                        embed=create_error_embed("timeout duration must be a valid number"), ephemeral=True
+                    )
+                    return
+
+            # Store multiple punishments as comma-separated string
+            punishment_string = ",".join(punishments)
+
+            async with aiosqlite.connect(DATABASE_PATH) as db:
+                await db.execute("""
+                    INSERT INTO automod_settings (guild_id, multiline_max_lines, multiline_punishment, multiline_timeout)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(guild_id) DO UPDATE SET
+                    multiline_max_lines = excluded.multiline_max_lines,
+                    multiline_punishment = excluded.multiline_punishment,
+                    multiline_timeout = excluded.multiline_timeout
+                """, (self.guild_id, max_lines_val, punishment_string, timeout_seconds))
+                await db.commit()
+
+            punishment_display = " â ".join(punishments)
+            embed = create_success_embed(f"updated multiline settings: {max_lines_val} lines, {punishment_display} ({timeout_seconds}s timeout)")
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+
+        except ValueError:
+            await interaction.response.send_message(
+                embed=create_error_embed("please enter valid numbers for max lines and timeout duration"), ephemeral=True
+            )
+
+
+class ExemptChannelModal(discord.ui.Modal):
+    """Modal for channel exemption"""
+
+    def __init__(self, guild_id, action):
+        super().__init__(title=f"{action} exempt channel")
+        self.guild_id = guild_id
+        self.action = action
+
+        self.channel_input = discord.ui.TextInput(
+            label="channel id or mention",
+            placeholder="#channel or 123456789",
+            max_length=100
+        )
+        self.add_item(self.channel_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        channel_text = self.channel_input.value.strip()
+
+        # Extract channel ID
+        channel_id = None
+        if channel_text.startswith('<#') and channel_text.endswith('>'):
+            channel_id = channel_text[2:-1]
+        elif channel_text.isdigit():
+            channel_id = channel_text
+        else:
+            await interaction.response.send_message(
+                embed=create_error_embed("invalid channel format"), ephemeral=True
+            )
+            return
+
+        # Verify channel exists
+        channel = interaction.guild.get_channel(int(channel_id))
+        if not channel:
+            await interaction.response.send_message(
+                embed=create_error_embed("channel not found"), ephemeral=True
+            )
+            return
+
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            cursor = await db.execute("SELECT exempt_channels FROM automod_settings WHERE guild_id = ?", (self.guild_id,))
+            result = await cursor.fetchone()
+
+            exempt_channels = []
+            if result and result[0]:
+                exempt_channels = result[0].split(',')
+
+            if self.action == "add":
+                if channel_id in exempt_channels:
+                    await interaction.response.send_message(
+                        embed=create_error_embed("channel already exempt"), ephemeral=True
+                    )
+                    return
+                exempt_channels.append(channel_id)
+                message = f"added {channel.mention} to exempt channels"
+            else:  # remove
+                if channel_id not in exempt_channels:
+                    await interaction.response.send_message(
+                        embed=create_error_embed("channel not in exempt list"), ephemeral=True
+                    )
+                    return
+                exempt_channels.remove(channel_id)
+                message = f"removed {channel.mention} from exempt channels"
+
+            await db.execute("""
+                INSERT INTO automod_settings (guild_id, exempt_channels) 
+                VALUES (?, ?)
+                ON CONFLICT(guild_id) DO UPDATE SET exempt_channels = excluded.exempt_channels
+            """, (self.guild_id, ','.join(exempt_channels)))
+            await db.commit()
+
+        embed = create_success_embed(message)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+class ExemptRoleModal(discord.ui.Modal):
+    """Modal for role exemption"""
+
+    def __init__(self, guild_id, action):
+        super().__init__(title=f"{action} exempt role")
+        self.guild_id = guild_id
+        self.action = action
+
+        self.role_input = discord.ui.TextInput(
+            label="role id or mention",
+            placeholder="@role or 123456789",
+            max_length=100
+        )
+        self.add_item(self.role_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        role_text = self.role_input.value.strip()
+
+        # Extract role ID
+        role_id = None
+        if role_text.startswith('<@&') and role_text.endswith('>'):
+            role_id = role_text[3:-1]
+        elif role_text.isdigit():
+            role_id = role_text
+        else:
+            await interaction.response.send_message(
+                embed=create_error_embed("invalid role format"), ephemeral=True
+            )
+            return
+
+        # Verify role exists
+        role = interaction.guild.get_role(int(role_id))
+        if not role:
+            await interaction.response.send_message(
+                embed=create_error_embed("role not found"), ephemeral=True
+            )
+            return
+
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            cursor = await db.execute("SELECT exempt_roles FROM automod_settings WHERE guild_id = ?", (self.guild_id,))
+            result = await cursor.fetchone()
+
+            exempt_roles = []
+            if result and result[0]:
+                exempt_roles = result[0].split(',')
+
+            if self.action == "add":
+                if role_id in exempt_roles:
+                    await interaction.response.send_message(
+                        embed=create_error_embed("role already exempt"), ephemeral=True
+                    )
+                    return
+                exempt_roles.append(role_id)
+                message = f"added {role.mention} to exempt roles"
+            else:  # remove
+                if role_id not in exempt_roles:
+                    await interaction.response.send_message(
+                        embed=create_error_embed("role not in exempt list"), ephemeral=True
+                    )
+                    return
+                exempt_roles.remove(role_id)
+                message = f"removed {role.mention} from exempt roles"
+
+            await db.execute("""
+                INSERT INTO automod_settings (guild_id, exempt_roles) 
+                VALUES (?, ?)
+                ON CONFLICT(guild_id) DO UPDATE SET exempt_roles = excluded.exempt_roles
+            """, (self.guild_id, ','.join(exempt_roles)))
+            await db.commit()
+
+        embed = create_success_embed(message)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+class LogChannelModal(discord.ui.Modal):
+    """Modal for log channel configuration"""
+
+    def __init__(self, guild_id):
+        super().__init__(title="set log channel")
+        self.guild_id = guild_id
+
+        self.channel_input = discord.ui.TextInput(
+            label="log channel",
+            placeholder="#channel or channel ID (leave empty to disable)",
+            required=False,
+            max_length=100
+        )
+        self.add_item(self.channel_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        channel_text = self.channel_input.value.strip()
+
+        if not channel_text:
+            # Disable logging
+            async with aiosqlite.connect(DATABASE_PATH) as db:
+                await db.execute("UPDATE automod_settings SET log_channel = NULL WHERE guild_id = ?", (self.guild_id,))
+                await db.commit()
+
+            embed = create_success_embed("disabled automod logging")
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+
+        # Extract channel ID
+        channel_id = None
+        if channel_text.startswith('<#') and channel_text.endswith('>'):
+            channel_id = channel_text[2:-1]
+        elif channel_text.isdigit():
+            channel_id = channel_text
+        else:
+            await interaction.response.send_message(
+                embed=create_error_embed("invalid channel format"), ephemeral=True
+            )
+            return
+
+        # Verify channel exists
+        channel = interaction.guild.get_channel(int(channel_id))
+        if not channel:
+            await interaction.response.send_message(
+                embed=create_error_embed("channel not found"), ephemeral=True
+            )
+            return
+
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            await db.execute("UPDATE automod_settings SET log_channel = ? WHERE guild_id = ?", (int(channel_id), self.guild_id))
+            await db.commit()
+
+        embed = create_success_embed(f"set log channel to {channel.mention}")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+class ImportFileModal(discord.ui.Modal):
+    """Modal for importing regex patterns from text"""
+
+    def __init__(self, guild_id):
+        super().__init__(title="import regex patterns")
+        self.guild_id = guild_id
+
+        self.file_content = discord.ui.TextInput(
+            label="paste file content here",
+            placeholder="paste file content - one regex per line",
+            style=discord.TextStyle.paragraph,
+            max_length=4000
+        )
+        self.add_item(self.file_content)
+
+        self.import_type = discord.ui.TextInput(
+            label="import options",
+            placeholder="add_slashes=yes/no (default: yes) - automatically add / / to patterns",
+            required=False,
+            max_length=50
+        )
+        self.add_item(self.import_type)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            content = self.file_content.value.strip()
+            options = self.import_type.value.strip().lower()
+
+            if not content:
+                await interaction.response.send_message(
+                    embed=create_error_embed("file content cannot be empty"), ephemeral=True
+                )
+                return
+
+            # Parse options
+            add_slashes = True
+            if "add_slashes=no" in options:
+                add_slashes = False
+
+            # Split content into lines and filter out empty lines
+            lines = [line.strip() for line in content.split('\n') if line.strip()]
+
+            if not lines:
+                await interaction.response.send_message(
+                    embed=create_error_embed("no valid patterns found"), ephemeral=True
+                )
+                return
+
+            # Get current blocked words
+            async with aiosqlite.connect(DATABASE_PATH) as db:
+                cursor = await db.execute("SELECT blocked_words FROM automod_settings WHERE guild_id = ?", (self.guild_id,))
+                result = await cursor.fetchone()
+
+                current_words = []
+                if result and result[0]:
+                    current_words = [w.strip() for w in result[0].split(',') if w.strip()]
+
+                # Process each line
+                valid_patterns = []
+                invalid_patterns = []
+                duplicate_patterns = []
+
+                for line in lines:
+                    # Skip comments and empty lines
+                    if line.startswith('#') or not line:
+                        continue
+
+                    pattern = line
+
+                    # Add slashes if needed and requested
+                    if add_slashes and not (pattern.startswith('/') and pattern.endswith('/')):
+                        pattern = f"/{pattern}/"
+
+                    # Validate regex pattern if it has slashes
+                    if pattern.startswith('/') and pattern.endswith('/'):
+                        regex_content = pattern[1:-1]
+                        try:
+                            re.compile(regex_content)
+                        except re.error as e:
+                            invalid_patterns.append(f"{line}: {str(e)}")
+                            continue
+
+                    # Check for duplicates
+                    if pattern in current_words:
+                        duplicate_patterns.append(pattern)
+                        continue
+
+                    valid_patterns.append(pattern)
+
+                if not valid_patterns and not duplicate_patterns:
+                    error_msg = "no valid patterns to import"
+                    if invalid_patterns:
+                        error_msg += f"\n\nInvalid patterns:\n" + "\n".join(invalid_patterns[:5])
+                    await interaction.response.send_message(
+                        embed=create_error_embed(error_msg), ephemeral=True
+                    )
+                    return
+
+                # Add valid patterns to current words
+                current_words.extend(valid_patterns)
+
+                # Update database
+                await db.execute("""
+                    INSERT INTO automod_settings (guild_id, blocked_words) 
+                    VALUES (?, ?)
+                    ON CONFLICT(guild_id) DO UPDATE SET blocked_words = ?
+                """, (self.guild_id, ','.join(current_words), ','.join(current_words)))
+                await db.commit()
+
+            # Create success embed with statistics
+            embed = create_success_embed(f"imported {len(valid_patterns)} regex patterns")
+
+            if valid_patterns:
+                # Show first few patterns
+                preview = valid_patterns[:5]
+                if len(valid_patterns) > 5:
+                    preview.append(f"... and {len(valid_patterns) - 5} more")
+                embed.add_field(name="added patterns", value="\n".join(f"`{p}`" for p in preview), inline=False)
+
+            if duplicate_patterns:
+                embed.add_field(name=f"skipped duplicates ({len(duplicate_patterns)})", value=f"{len(duplicate_patterns)} patterns already exist", inline=True)
+
+            if invalid_patterns:
+                embed.add_field(name=f"invalid patterns ({len(invalid_patterns)})", value=f"{len(invalid_patterns)} patterns had regex errors", inline=True)
+
+            embed.add_field(name="ð¡ tip", value="patterns are automatically wrapped with `/pattern/` unless already formatted", inline=False)
+
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+
+        except Exception as e:
+            embed = create_error_embed(f"error importing patterns: {str(e)}")
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+
+class ModuleSpecificExemptChannelModal(discord.ui.Modal):
+    """Modal for module-specific channel exemption"""
+
+    def __init__(self, guild_id, module_type, action):
+        super().__init__(title=f"{action} {module_type} exempt channel")
+        self.guild_id = guild_id
+        self.module_type = module_type
+        self.action = action
+
+        self.channel_input = discord.ui.TextInput(
+            label="channel id or mention",
+            placeholder="#channel or 123456789",
+            max_length=100
+        )
+        self.add_item(self.channel_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        channel_text = self.channel_input.value.strip()
+
+        # Extract channel ID
+        channel_id = None
+        if channel_text.startswith('<#') and channel_text.endswith('>'):
+            channel_id = channel_text[2:-1]
+        elif channel_text.isdigit():
+            channel_id = channel_text
+        else:
+            await interaction.response.send_message(
+                embed=create_error_embed("invalid channel format"), ephemeral=True
+            )
+            return
+
+        # Verify channel exists
+        channel = interaction.guild.get_channel(int(channel_id))
+        if not channel:
+            await interaction.response.send_message(
+                embed=create_error_embed("channel not found"), ephemeral=True
+            )
+            return
+
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            channel_col = f"{self.module_type}_exempt_channels"
+            cursor = await db.execute(f"SELECT {channel_col} FROM automod_settings WHERE guild_id = ?", (self.guild_id,))
+            result = await cursor.fetchone()
+
+            exempt_channels = []
+            if result and result[0]:
+                exempt_channels = result[0].split(',')
+
+            if self.action == "add":
+                if channel_id in exempt_channels:
+                    await interaction.response.send_message(
+                        embed=create_error_embed(f"channel already exempt from {self.module_type}"), ephemeral=True
+                    )
+                    return
+                exempt_channels.append(channel_id)
+                message = f"added {channel.mention} to {self.module_type} exemptions"
+            else:  # remove
+                if channel_id not in exempt_channels:
+                    await interaction.response.send_message(
+                        embed=create_error_embed(f"channel not exempt from {self.module_type}"), ephemeral=True
+                    )
+                    return
+                exempt_channels.remove(channel_id)
+                message = f"removed {channel.mention} from {self.module_type} exemptions"
+
+            await db.execute(f"""
+                INSERT INTO automod_settings (guild_id, {channel_col}) 
+                VALUES (?, ?)
+                ON CONFLICT(guild_id) DO UPDATE SET {channel_col} = excluded.{channel_col}
+            """, (self.guild_id, ','.join(exempt_channels)))
+            await db.commit()
+
+        embed = create_success_embed(message)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+class ModuleSpecificExemptRoleModal(discord.ui.Modal):
+    """Modal for module-specific role exemption"""
+
+    def __init__(self, guild_id, module_type, action):
+        super().__init__(title=f"{action} {module_type} exempt role")
+        self.guild_id = guild_id
+        self.module_type = module_type
+        self.action = action
+
+        self.role_input = discord.ui.TextInput(
+            label="role id or mention",
+            placeholder="@role or 123456789",
+            max_length=100
+        )
+        self.add_item(self.role_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        role_text = self.role_input.value.strip()
+
+        # Extract role ID
+        role_id = None
+        if role_text.startswith('<@&') and role_text.endswith('>'):
+            role_id = role_text[3:-1]
+        elif role_text.isdigit():
+            role_id = role_text
+        else:
+            await interaction.response.send_message(
+                embed=create_error_embed("invalid role format"), ephemeral=True
+            )
+            return
+
+        # Verify role exists
+        role = interaction.guild.get_role(int(role_id))
+        if not role:
+            await interaction.response.send_message(
+                embed=create_error_embed("role not found"), ephemeral=True
+            )
+            return
+
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            role_col = f"{self.module_type}_exempt_roles"
+            cursor = await db.execute(f"SELECT {role_col} FROM automod_settings WHERE guild_id = ?", (self.guild_id,))
+            result = await cursor.fetchone()
+
+            exempt_roles = []
+            if result and result[0]:
+                exempt_roles = result[0].split(',')
+
+            if self.action == "add":
+                if role_id in exempt_roles:
+                    await interaction.response.send_message(
+                        embed=create_error_embed(f"role already exempt from {self.module_type}"), ephemeral=True
+                    )
+                    return
+                exempt_roles.append(role_id)
+                message = f"added {role.mention} to {self.module_type} exemptions"
+            else:  # remove
+                if role_id not in exempt_roles:
+                    await interaction.response.send_message(
+                        embed=create_error_embed(f"role not exempt from {self.module_type}"), ephemeral=True
+                    )
+                    return
+                exempt_roles.remove(role_id)
+                message = f"removed {role.mention} from {self.module_type} exemptions"
+
+            await db.execute(f"""
+                INSERT INTO automod_settings (guild_id, {role_col}) 
+                VALUES (?, ?)
+                ON CONFLICT(guild_id) DO UPDATE SET {role_col} = excluded.{role_col}
+            """, (self.guild_id, ','.join(exempt_roles)))
+            await db.commit()
+
+        embed = create_success_embed(message)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+class ConfirmClearView(discord.ui.View):
+    """Confirmation view for clearing all words"""
+
+    def __init__(self, guild_id, timeout=60):
+        super().__init__(timeout=timeout)
+        self.guild_id = guild_id
+
+    @discord.ui.button(label="yes, clear all", style=discord.ButtonStyle.danger, emoji="â")
+    async def confirm_clear(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Confirm clear all words"""
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            await db.execute("""
+                INSERT INTO automod_settings (guild_id, blocked_words) 
+                VALUES (?, '')
+                ON CONFLICT(guild_id) DO UPDATE SET blocked_words = excluded.blocked_words
+            """, (self.guild_id,))
+            await db.commit()
+
+        embed = create_success_embed("cleared all banned words")
+        await interaction.response.edit_message(embed=embed, view=None)
+
+    @discord.ui.button(label="cancel", style=discord.ButtonStyle.secondary, emoji="â")
+    async def cancel_clear(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Cancel clear operation"""
+        embed = create_embed(
+            title="â cancelled",
+            description="no words were removed",
+            color=0x95A5A6
+        )
+        await interaction.response.edit_message(embed=embed, view=None)
+
+# New view for exemption management main panel
+class ExemptionMainView(discord.ui.View):
+    """Exemption management main interface"""
+
+    def __init__(self, guild_id, timeout=300):
+        super().__init__(timeout=timeout)
+        self.guild_id = guild_id
+
+    async def get_exemptions(self):
+        """Get exemptions from database"""
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            cursor = await db.execute("""
+                SELECT exempt_channels, exempt_roles FROM automod_settings WHERE guild_id = ?
+            """, (self.guild_id,))
+            row = await cursor.fetchone()
+
+            if row:
+                exempt_channels = row[0].split(',') if row[0] else []
+                exempt_roles = row[1].split(',') if row[1] else []
+                return {
+                    'exempt_channels': [ch for ch in exempt_channels if ch],
+                    'exempt_roles': [role for role in exempt_roles if role]
+                }
+            else:
+                return {'exempt_channels': [], 'exempt_roles': []}
+
+    async def create_exemption_main_embed(self):
+        """Create exemption management main embed"""
+        exemptions = await self.get_exemptions()
+
+        embed = create_embed(
+            title="ð¡ï¸ exemption management",
+            description="manage global and module-specific exemptions",
+            color=0x9B59B6
+        )
+
+        # Global exemptions
+        if exemptions['exempt_channels']:
+            channels = [f"<#{ch_id}>" for ch_id in exemptions['exempt_channels'][:5]]
+            more = len(exemptions['exempt_channels']) - 5
+            embed.add_field(
+                name=f"ð global exempt channels ({len(exemptions['exempt_channels'])})",
+                value=", ".join(channels) + (f"\n... and {more} more" if more > 0 else ""),
+                inline=True
+            )
+        else:
+            embed.add_field(
+                name="ð global exempt channels (0)",
+                value="none",
+                inline=True
+            )
+
+        if exemptions['exempt_roles']:
+            roles = [f"<@&{role_id}>" for role_id in exemptions['exempt_roles'][:5]]
+            more = len(exemptions['exempt_roles']) - 5
+            embed.add_field(
+                name=f"ð global exempt roles ({len(exemptions['exempt_roles'])})",
+                value=", ".join(roles) + (f"\n... and {more} more" if more > 0 else ""),
+                inline=True
+            )
+        else:
+            embed.add_field(
+                name="ð global exempt roles (0)",
+                value="none",
+                inline=True
+            )
+
+        embed.add_field(
+            name="â¹ï¸ exemption types",
+            value="**global**: exempt from ALL modules\n**module-specific**: exempt from specific modules only",
+            inline=False
+        )
+
+        embed.add_field(
+            name="ð¡ tip",
+            value="users with manage server permission bypass all automod globally",
+            inline=False
+        )
+
+        return embed
+
+    @discord.ui.button(label="global exemptions", style=discord.ButtonStyle.secondary, emoji="ð", row=0)
+    async def global_exemptions(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Manage global exemptions"""
+        view = GlobalExemptionView(self.guild_id)
+        embed = await view.create_global_exemption_embed()
+        await interaction.response.edit_message(embed=embed, view=view)
+
+    @discord.ui.button(label="module exemptions", style=discord.ButtonStyle.secondary, emoji="ð¯", row=0)
+    async def module_exemptions(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Manage module-specific exemptions"""
+        view = ModuleExemptionView(self.guild_id)
+        embed = await view.create_module_exemption_embed()
+        await interaction.response.edit_message(embed=embed, view=view)
+
+    @discord.ui.button(label="â back", style=discord.ButtonStyle.primary, row=2)
+    async def back_to_main(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Go back to main panel"""
+        view = AutoModMainView(self.guild_id)
+        embed = await view.create_main_embed()
+        await interaction.response.edit_message(embed=embed, view=view)
+
+
+class GlobalExemptionView(discord.ui.View):
+    """Global exemption management interface"""
+
+    def __init__(self, guild_id, timeout=300):
+        super().__init__(timeout=timeout)
+        self.guild_id = guild_id
+
+    async def get_exemptions(self):
+        """Get exemptions from database"""
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            cursor = await db.execute("""
+                SELECT exempt_channels, exempt_roles FROM automod_settings WHERE guild_id = ?
+            """, (self.guild_id,))
+            row = await cursor.fetchone()
+
+            if row:
+                exempt_channels = row[0].split(',') if row[0] else []
+                exempt_roles = row[1].split(',') if row[1] else []
+                return {
+                    'exempt_channels': [ch for ch in exempt_channels if ch],
+                    'exempt_roles': [role for role in exempt_roles if role]
+                }
+            else:
+                return {'exempt_channels': [], 'exempt_roles': []}
+
+    async def create_global_exemption_embed(self):
+        """Create global exemption embed"""
+        exemptions = await self.get_exemptions()
+
+        embed = create_embed(
+            title="ð global exemptions",
+            description="channels and roles exempt from ALL automod modules",
+            color=0x3498DB
+        )
+
+        if exemptions['exempt_channels']:
+            channels = [f"<#{ch_id}>" for ch_id in exemptions['exempt_channels'][:15]]
+            more = len(exemptions['exempt_channels']) - 15
+            embed.add_field(
+                name=f"ðº exempt channels ({len(exemptions['exempt_channels'])})",
+                value=", ".join(channels) + (f"\n... and {more} more" if more > 0 else ""),
+                inline=False
+            )
+        else:
+            embed.add_field(
+                name="ðº exempt channels (0)",
+                value="no globally exempt channels",
+                inline=False
+            )
+
+        if exemptions['exempt_roles']:
+            roles = [f"<@&{role_id}>" for role_id in exemptions['exempt_roles'][:15]]
+            more = len(exemptions['exempt_roles']) - 15
+            embed.add_field(
+                name=f"ð¥ exempt roles ({len(exemptions['exempt_roles'])})",
+                value=", ".join(roles) + (f"\n... and {more} more" if more > 0 else ""),
+                inline=False
+            )
+        else:
+            embed.add_field(
+                name="ð¥ exempt roles (0)",
+                value="no globally exempt roles",
+                inline=False
+            )
+
+        embed.add_field(
+            name="â¹ï¸ global exemptions",
+            value="these channels/roles are exempt from **all** automod modules",
+            inline=False
+        )
+
+        return embed
+
+    @discord.ui.button(label="add channel", style=discord.ButtonStyle.success, emoji="ðº", row=0)
+    async def add_channel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Add globally exempt channel"""
+        modal = ExemptChannelModal(self.guild_id, "add")
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="remove channel", style=discord.ButtonStyle.danger, emoji="ðï¸", row=0)
+    async def remove_channel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Remove globally exempt channel"""
+        modal = ExemptChannelModal(self.guild_id, "remove")
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="add role", style=discord.ButtonStyle.success, emoji="ð¥", row=1)
+    async def add_role(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Add globally exempt role"""
+        modal = ExemptRoleModal(self.guild_id, "add")
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="remove role", style=discord.ButtonStyle.danger, emoji="ðï¸", row=1)
+    async def remove_role(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Remove globally exempt role"""
+        modal = ExemptRoleModal(self.guild_id, "remove")
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="â back", style=discord.ButtonStyle.primary, row=2)
+    async def back_to_exemption_main(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Go back to exemption main"""
+        view = ExemptionMainView(self.guild_id)
+        embed = await view.create_exemption_main_embed()
+        await interaction.response.edit_message(embed=embed, view=view)
+
+class ModuleExemptionView(discord.ui.View):
+    """Module-specific exemption management interface"""
+
+    def __init__(self, guild_id, timeout=300):
+        super().__init__(timeout=timeout)
+        self.guild_id = guild_id
+
+    async def get_module_exemptions(self):
+        """Get module-specific exemptions from database"""
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            # Add module exemption columns if they don't exist
+            exemption_columns = [
+                'antispam_exempt_channels', 'antispam_exempt_roles',
+                'antilink_exempt_channels', 'antilink_exempt_roles', 
+                'antiinvite_exempt_channels', 'antiinvite_exempt_roles',
+                'word_filter_exempt_channels', 'word_filter_exempt_roles'
+            ]
+
+            for column in exemption_columns:
+                try:
+                    await db.execute(f"ALTER TABLE automod_settings ADD COLUMN {column} TEXT DEFAULT ''")
+                except:
+                    pass  # Column already exists
+
+            await db.commit()
+
+            cursor = await db.execute("""
+                SELECT antispam_exempt_channels, antispam_exempt_roles,
+                       antilink_exempt_channels, antilink_exempt_roles,
+                       antiinvite_exempt_channels, antiinvite_exempt_roles,
+                       word_filter_exempt_channels, word_filter_exempt_roles
+                FROM automod_settings WHERE guild_id = ?
+            """, (self.guild_id,))
+            row = await cursor.fetchone()
+
+            if row:
+                return {
+                    'antispam_exempt_channels': [ch for ch in (row[0] or '').split(',') if ch.strip()],
+                    'antispam_exempt_roles': [role for role in (row[1] or '').split(',') if role.strip()],
+                    'antilink_exempt_channels': [ch for ch in (row[2] or '').split(',') if ch.strip()],
+                    'antilink_exempt_roles': [role for role in (row[3] or '').split(',') if role.strip()],
+                    'antiinvite_exempt_channels': [ch for ch in (row[4] or '').split(',') if ch.strip()],
+                    'antiinvite_exempt_roles': [role for role in (row[5] or '').split(',') if role.strip()],
+                    'word_filter_exempt_channels': [ch for ch in (row[6] or '').split(',') if ch.strip()],
+                    'word_filter_exempt_roles': [role for role in (row[7] or '').split(',') if role.strip()]
+                }
+            else:
+                return {
+                    'antispam_exempt_channels': [], 'antispam_exempt_roles': [],
+                    'antilink_exempt_channels': [], 'antilink_exempt_roles': [],
+                    'antiinvite_exempt_channels': [], 'antiinvite_exempt_roles': [],
+                    'word_filter_exempt_channels': [], 'word_filter_exempt_roles': []
+                }
+
+    async def create_module_exemption_embed(self):
+        """Create module-specific exemption embed"""
+        exemptions = await self.get_module_exemptions()
+
+        embed = create_embed(
+            title="ð¯ module-specific exemptions",
+            description="exempt channels/roles from specific automod modules",
+            color=0xE74C3C
+        )
+
+        # Count total exemptions per module
+        modules = [
+            ("ð« anti-spam", exemptions['antispam_exempt_channels'], exemptions['antispam_exempt_roles']),
+            ("ð anti-links", exemptions['antilink_exempt_channels'], exemptions['antilink_exempt_roles']),
+            ("ð¨ anti-invites", exemptions['antiinvite_exempt_channels'], exemptions['antiinvite_exempt_roles']),
+            ("ð¤ word filter", exemptions['word_filter_exempt_channels'], exemptions['word_filter_exempt_roles'])
+        ]
+
+        for module_name, exempt_channels, exempt_roles in modules:
+            total_exemptions = len(exempt_channels) + len(exempt_roles)
+            if total_exemptions > 0:
+                channel_preview = [f"<#{ch_id}>" for ch_id in exempt_channels[:3]]
+                role_preview = [f"<@&{role_id}>" for role_id in exempt_roles[:3]]
+
+                preview_text = []
+                if channel_preview:
+                    preview_text.extend(channel_preview)
+                if role_preview:
+                    preview_text.extend(role_preview)
+
+                remaining = total_exemptions - len(preview_text)
+                if remaining > 0:
+                    preview_text.append(f"... and {remaining} more")
+
+                embed.add_field(
+                    name=f"{module_name} ({total_exemptions})",
+                    value=", ".join(preview_text) if preview_text else "none",
+                    inline=False
+                )
+            else:
+                embed.add_field(
+                    name=f"{module_name} (0)",
+                    value="no exemptions",
+                    inline=False
+                )
+
+        embed.add_field(
+            name="â¹ï¸ module exemptions",
+            value="these exemptions only apply to specific modules, not globally",
+            inline=False
+        )
+
+        return embed
+
+    @discord.ui.button(label="spam exemptions", style=discord.ButtonStyle.secondary, row=0)
+    async def antispam_exemptions(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Manage anti-spam exemptions"""
+        view = SpecificModuleExemptionView(self.guild_id, "antispam", "ð« anti-spam")
+        embed = await view.create_specific_exemption_embed()
+        await interaction.response.edit_message(embed=embed, view=view)
+
+    @discord.ui.button(label="link exemptions", style=discord.ButtonStyle.secondary, row=0)
+    async def antilink_exemptions(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Manage anti-link exemptions"""
+        view = SpecificModuleExemptionView(self.guild_id, "antilink", "ð anti-links")
+        embed = await view.create_specific_exemption_embed()
+        await interaction.response.edit_message(embed=embed, view=view)
+
+    @discord.ui.button(label="invite exemptions", style=discord.ButtonStyle.secondary, row=1)
+    async def antiinvite_exemptions(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Manage anti-invite exemptions"""
+        view = SpecificModuleExemptionView(self.guild_id, "antiinvite", "ð¨ anti-invites")
+        embed = await view.create_specific_exemption_embed()
+        await interaction.response.edit_message(embed=embed, view=view)
+
+    @discord.ui.button(label="word filter exemptions", style=discord.ButtonStyle.secondary, emoji="ð¤", row=1)
+    async def word_filter_exemptions(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Manage word filter exemptions"""
+        view = SpecificModuleExemptionView(self.guild_id, "word_filter", "ð¤ word filter")
+        embed = await view.create_specific_exemption_embed()
+        await interaction.response.edit_message(embed=embed, view=view)
+
+    @discord.ui.button(label="â back", style=discord.ButtonStyle.primary, row=2)
+    async def back_to_exemption_main(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Go back to exemption main"""
+        view = ExemptionMainView(self.guild_id)
+        embed = await view.create_exemption_main_embed()
+        await interaction.response.edit_message(embed=embed, view=view)
+
+class SpecificModuleExemptionView(discord.ui.View):
+    """Specific module exemption management interface"""
+
+    def __init__(self, guild_id, module_type, module_display_name, timeout=300):
+        super().__init__(timeout=timeout)
+        self.guild_id = guild_id
+        self.module_type = module_type
+        self.module_display_name = module_display_name
+
+    async def get_specific_exemptions(self):
+        """Get exemptions for specific module"""
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            channel_col = f"{self.module_type}_exempt_channels"
+            role_col = f"{self.module_type}_exempt_roles"
+
+            cursor = await db.execute(f"""
+                SELECT {channel_col}, {role_col} FROM automod_settings WHERE guild_id = ?
+            """, (self.guild_id,))
+            row = await cursor.fetchone()
+
+            if row:
+                exempt_channels = [ch for ch in (row[0] or '').split(',') if ch.strip()]
+                exempt_roles = [role for role in (row[1] or '').split(',') if role.strip()]
+                return {'exempt_channels': exempt_channels, 'exempt_roles': exempt_roles}
+            else:
+                return {'exempt_channels': [], 'exempt_roles': []}
+
+    async def create_specific_exemption_embed(self):
+        """Create specific module exemption embed"""
+        exemptions = await self.get_specific_exemptions()
+
+        embed = create_embed(
+            title=f"{self.module_display_name} exemptions",
+            description=f"manage exemptions for {self.module_display_name} module only",
+            color=0xF39C12
+        )
+
+        if exemptions['exempt_channels']:
+            channels = [f"<#{ch_id}>" for ch_id in exemptions['exempt_channels'][:15]]
+            more = len(exemptions['exempt_channels']) - 15
+            embed.add_field(
+                name=f"ðº exempt channels ({len(exemptions['exempt_channels'])})",
+                value=", ".join(channels) + (f"\n... and {more} more" if more > 0 else ""),
+                inline=False
+            )
+        else:
+            embed.add_field(
+                name="ðº exempt channels (0)",
+                value="no exempt channels for this module",
+                inline=False
+            )
+
+        if exemptions['exempt_roles']:
+            roles = [f"<@&{role_id}>" for role_id in exemptions['exempt_roles'][:15]]
+            more = len(exemptions['exempt_roles']) - 15
+            embed.add_field(
+                name=f"ð¥ exempt roles ({len(exemptions['exempt_roles'])})",
+                value=", ".join(roles) + (f"\n... and {more} more" if more > 0 else ""),
+                inline=False
+            )
+        else:
+            embed.add_field(
+                name="ð¥ exempt roles (0)",
+                value="no exempt roles for this module",
+                inline=False
+            )
+
+        embed.add_field(
+            name="â¹ï¸ module-specific exemptions",
+            value=f"these exemptions only apply to **{self.module_display_name}** - other modules will still apply",
+            inline=False
+        )
+
+        return embed
+
+    @discord.ui.button(label="add channel", style=discord.ButtonStyle.success, emoji="ðº", row=0)
+    async def add_channel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Add module-specific exempt channel"""
+        modal = ModuleSpecificExemptChannelModal(self.guild_id, self.module_type, "add")
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="remove channel", style=discord.ButtonStyle.danger, emoji="ðï¸", row=0)
+    async def remove_channel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Remove module-specific exempt channel"""
+        modal = ModuleSpecificExemptChannelModal(self.guild_id, self.module_type, "remove")
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="add role", style=discord.ButtonStyle.success, emoji="ð¥", row=1)
+    async def add_role(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Add module-specific exempt role"""
+        modal = ModuleSpecificExemptRoleModal(self.guild_id, self.module_type, "add")
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="remove role", style=discord.ButtonStyle.danger, emoji="ðï¸", row=1)
+    async def remove_role(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Remove module-specific exempt role"""
+        modal = ModuleSpecificExemptRoleModal(self.guild_id, self.module_type, "remove")
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="â back", style=discord.ButtonStyle.primary, row=2)
+    async def back_to_module_exemptions(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Go back to module exemptions"""
+        view = ModuleExemptionView(self.guild_id)
+        embed = await view.create_module_exemption_embed()
+        await interaction.response.edit_message(embed=embed, view=view)
+
+class AutoMod(commands.Cog):
+    """Enhanced automoderation system with comprehensive interface"""
+
+    def __init__(self, bot):
+        self.bot = bot
+        self.spam_tracker = defaultdict(lambda: deque(maxlen=10))
+        self.violation_tracker = defaultdict(lambda: defaultdict(list))
+
+        # Enhanced regex patterns with better coverage
+        self.invite_pattern = re.compile(
+            r'(?:https?:\/\/)?(?:www\.)?(?:discord\.(?:gg|io|me|li)|discordapp\.com\/invite|discord(?:app)?\.com\/invite)\/[a-zA-Z0-9-_]+',
+            re.IGNORECASE
+        )
+        self.url_pattern = re.compile(
+            r'https?:\/\/(?:[-\w.])+(?:\:[0-9]+)?(?:\/(?:[\w\/_.])*(?:\?(?:[\w&=%.])*)?(?:\#(?:[\w.])*)?)?', 
+            re.IGNORECASE
+        )
+
+        # Compiled regex cache for better performance
+        self.regex_cache = {}
+        self.cache_max_size = 100
+
+        # Unicode normalization patterns for bypass detection
+        self.zalgo_pattern = re.compile(r'[\u0300-\u036f\u1ab0-\u1aff\u1dc0-\u1dff\u20d0-\u20ff\ufe20-\ufe2f]')
+
+        # Character substitution map for leetspeak and similar bypasses
+        self.char_substitutions = {
+            '4': 'a', '@': 'a', '3': 'e', '1': 'i', '!': 'i', '0': 'o', 
+            '5': 's', '$': 's', '7': 't', '+': 't', '2': 'z'
+        }
+
+    @commands.hybrid_command(name='automod')
+    @commands.has_permissions(administrator=True)
+    async def automod_command(self, ctx):
+        """comprehensive automoderation control panel"""
+        view = AutoModMainView(ctx.guild.id)
+        embed = await view.create_main_embed()
+        await ctx.send(embed=embed, view=view)
+
+    @commands.hybrid_command(name='regextest')
+    @commands.has_permissions(administrator=True)
+    async def regex_test_command(self, ctx, pattern: str, *, test_text: str):
+        """test regex patterns against text for automod word filter
+
+        parameters:
+        - pattern: regex pattern (with or without //)
+        - test_text: text to test the pattern against
+
+        examples:
+        - /regex test "/bad[w0o]rd/" "badword and badw0rd"
+        - /regex test "t[o0]x[i1]c" "toxic and t0x1c variants"
+        """
+        # Remove forward slashes if present
+        if pattern.startswith('/') and pattern.endswith('/') and len(pattern) > 2:
+            clean_pattern = pattern[1:-1]
+        else:
+            clean_pattern = pattern
+
+        embed = create_embed(
+            title="regex pattern test",
+            description="testing automod word filter pattern",
+            color=0x3498DB
+        )
+
+        try:
+            # Test against multiple versions of content for comprehensive detection
+            test_strings = [test_text, self.normalize_text(test_text)]
+            
+            compiled_regex = self.get_compiled_regex(clean_pattern)
+            if compiled_regex is None:
+                raise re.error("Invalid regex pattern")
+
+            original_match = compiled_regex.search(test_strings[0])
+            normalized_match = compiled_regex.search(test_strings[1])
+
+            # Results
+            embed.add_field(
+                name="pattern",
+                value=f"`{clean_pattern}`",
+                inline=False
+            )
+
+            embed.add_field(
+                name="test text",
+                value=f"`{test_strings[0][:200]}{'...' if len(test_strings[0]) > 200 else ''}`",
+                inline=False
+            )
+
+            embed.add_field(
+                name="normalized text",
+                value=f"`{test_strings[1][:200]}{'...' if len(test_strings[1]) > 200 else ''}`",
+                inline=False
+            )
+
+            # Match results
+            if original_match:
+                embed.add_field(
+                    name="â original text match",
+                    value=f"matched: `{original_match.group()}`\nposition: {original_match.start()}-{original_match.end()}",
+                    inline=True
+                )
+            else:
+                embed.add_field(
+                    name="â original text match",
+                    value="no match found",
+                    inline=True
+                )
+
+            if normalized_match:
+                embed.add_field(
+                    name="â normalized text match",
+                    value=f"matched: `{normalized_match.group()}`\nposition: {normalized_match.start()}-{normalized_match.end()}",
+                    inline=True
+                )
+            else:
+                embed.add_field(
+                    name="â normalized text match", 
+                    value="no match found",
+                    inline=True
+                )
+
+            # Overall result
+            will_trigger = original_match or normalized_match
+            embed.add_field(
+                name="automod result",
+                value=f"{'ð« would be blocked' if will_trigger else 'â would be allowed'}",
+                inline=False
+            )
+
+        except re.error as e:
+            embed.add_field(
+                name="â invalid regex pattern",
+                value=f"error: `{str(e)}`",
+                inline=False
+            )
+
+            # Provide common regex examples
+            examples = [
+                "`/bad[w0o]rd/` - matches badword, badw0rd, bad0rd",
+                "`/t[o0]x[i1]c/` - matches toxic, t0xic, tox1c, t0x1c",
+                "`/sp[a4@]m+/` - matches spam, sp4m, sp@m, spamm",
+                "`/n[o0]{2,}b/` - matches noob, n00b, nooob, n000b",
+                "`/(?:bad|evil|hate)/` - matches bad, evil, or hate"
+            ]
+
+            embed.add_field(
+                name="regex examples",
+                value="\n".join(examples),
+                inline=False
+            )
+
+        await ctx.send(embed=embed)
+
+    async def get_automod_settings(self, guild_id):
+        """Get automod settings for guild"""
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            # Ensure timeout columns exist
+            timeout_columns = [
+                ('antispam_timeout', 'INTEGER DEFAULT 600'),
+                ('antilink_timeout', 'INTEGER DEFAULT 600'),
+                ('antiinvite_timeout', 'INTEGER DEFAULT 600'),
+                ('word_filter_timeout', 'INTEGER DEFAULT 600'),
+                ('word_filter_punishment', 'TEXT DEFAULT "delete"'),
+                ('multiline_enabled', 'INTEGER DEFAULT 0'),
+                ('multiline_max_lines', 'INTEGER DEFAULT 10'),
+                ('multiline_punishment', 'TEXT DEFAULT "delete"'),
+                ('multiline_timeout', 'INTEGER DEFAULT 600')
+            ]
+
+            for column_name, column_type in timeout_columns:
+                try:
+                    await db.execute(f"ALTER TABLE automod_settings ADD COLUMN {column_name} {column_type}")
+                except:
+                    pass  # Column already exists
+
+            await db.commit()
+
+            cursor = await db.execute("""
+                SELECT antispam_enabled, antispam_threshold, antispam_timeframe, antispam_punishment, 
+                       antispam_timeout,
+                       antilink_enabled, antilink_punishment, 
+                       antilink_timeout,
+                       antiinvite_enabled, antiinvite_punishment, 
+                       antiinvite_timeout,
+                       exempt_channels, exempt_roles, log_channel, blocked_words, word_filter,
+                       word_filter_timeout,
+                       word_filter_punishment,
+                       COALESCE(antispam_exempt_channels, '') as antispam_exempt_channels,
+                       COALESCE(antispam_exempt_roles, '') as antispam_exempt_roles,
+                       COALESCE(antilink_exempt_channels, '') as antilink_exempt_channels,
+                       COALESCE(antilink_exempt_roles, '') as antilink_exempt_roles,
+                       COALESCE(antiinvite_exempt_channels, '') as antiinvite_exempt_channels,
+                       COALESCE(antiinvite_exempt_roles, '') as antiinvite_exempt_roles,
+                       COALESCE(word_filter_exempt_channels, '') as word_filter_exempt_channels,
+                       COALESCE(word_filter_exempt_roles, '') as word_filter_exempt_roles,
+                       COALESCE(multiline_enabled, 0) as multiline_enabled,
+                       COALESCE(multiline_max_lines, 10) as multiline_max_lines,
+                       COALESCE(multiline_punishment, 'delete') as multiline_punishment,
+                       COALESCE(multiline_timeout, 600) as multiline_timeout
+                FROM automod_settings WHERE guild_id = ?
+            """, (guild_id,))
+            row = await cursor.fetchone()
+
+            if row:
+                exempt_channels = [ch.strip() for ch in row[11].split(',') if ch.strip().isdigit()] if row[11] else []
+                exempt_roles = [role.strip() for role in row[12].split(',') if role.strip().isdigit()] if row[12] else []
+                blocked_words = [word.strip() for word in row[14].split(',') if word.strip()] if row[14] else []
+
+                # Parse module-specific exemptions
+                antispam_exempt_channels = [ch.strip() for ch in (row[18] or '').split(',') if ch.strip()]
+                antispam_exempt_roles = [role.strip() for role in (row[19] or '').split(',') if role.strip()]
+                antilink_exempt_channels = [ch.strip() for ch in (row[20] or '').split(',') if ch.strip()]
+                antilink_exempt_roles = [role.strip() for role in (row[21] or '').split(',') if role.strip()]
+                antiinvite_exempt_channels = [ch.strip() for ch in (row[22] or '').split(',') if ch.strip()]
+                antiinvite_exempt_roles = [role.strip() for role in (row[23] or '').split(',') if role.strip()]
+                word_filter_exempt_channels = [ch.strip() for ch in (row[24] or '').split(',') if ch.strip()]
+                word_filter_exempt_roles = [role.strip() for role in (row[25] or '').split(',') if role.strip()]
+
+                return {
+                    'antispam_enabled': bool(row[0]),
+                    'antispam_threshold': row[1] or 5,
+                    'antispam_timeframe': row[2] or 10,
+                    'antispam_punishment': row[3] or 'timeout',
+                    'antispam_timeout': int(row[4]) if row[4] is not None else 600,
+                    'antilink_enabled': bool(row[5]),
+                    'antilink_punishment': row[6] or 'delete',
+                    'antilink_timeout': int(row[7]) if row[7] is not None else 600,
+                    'antiinvite_enabled': bool(row[8]),
+                    'antiinvite_punishment': row[9] or 'delete',
+                    'antiinvite_timeout': int(row[10]) if row[10] is not None else 600,
+                    'exempt_channels': exempt_channels,
+                    'exempt_roles': exempt_roles,
+                    'log_channel': row[13],
+                    'blocked_words': blocked_words,
+                    'word_filter': bool(row[15]),
+                    'word_filter_timeout': int(row[16]) if row[16] is not None else 600,
+                    'word_filter_punishment': row[17] or 'delete',
+                    'antispam_exempt_channels': antispam_exempt_channels,
+                    'antispam_exempt_roles': antispam_exempt_roles,
+                    'antilink_exempt_channels': antilink_exempt_channels,
+                    'antilink_exempt_roles': antilink_exempt_roles,
+                    'antiinvite_exempt_channels': antiinvite_exempt_channels,
+                    'antiinvite_exempt_roles': antiinvite_exempt_roles,
+                    'word_filter_exempt_channels': word_filter_exempt_channels,
+                    'word_filter_exempt_roles': word_filter_exempt_roles,
+                    'multiline_enabled': bool(row[26]),
+                    'multiline_max_lines': row[27] or 10,
+                    'multiline_punishment': row[28] or 'delete',
+                    'multiline_timeout': int(row[29]) if row[29] is not None else 600
+                }
+            else:
+                # Initialize default settings in database when none exist
+                await db.execute("""
+                    INSERT OR IGNORE INTO automod_settings 
+                    (guild_id, antispam_enabled, antispam_threshold, antispam_timeframe, antispam_punishment, antispam_timeout,
+                     antilink_enabled, antilink_punishment, antilink_timeout,
+                     antiinvite_enabled, antiinvite_punishment, antiinvite_timeout,
+                     exempt_channels, exempt_roles, blocked_words, word_filter, word_filter_timeout, word_filter_punishment,
+                     antispam_exempt_channels, antispam_exempt_roles,
+                     antilink_exempt_channels, antilink_exempt_roles,
+                     antiinvite_exempt_channels, antiinvite_exempt_roles,
+                     word_filter_exempt_channels, word_filter_exempt_roles,
+                     multiline_enabled, multiline_max_lines, multiline_punishment, multiline_timeout)
+                    VALUES (?, 0, 5, 10, 'timeout', 600, 0, 'delete', 600, 0, 'delete', 600, '', '', '', 0, 600, 'delete',
+                            '', '', '', '', '', '', '', '',
+                            0, 10, 'delete', 600)
+                """, (guild_id,))
+                await db.commit()
+
+                return {
+                    'antispam_enabled': False,
+                    'antispam_threshold': 5,
+                    'antispam_timeframe': 10,
+                    'antispam_punishment': 'timeout',
+                    'antispam_timeout': 600,
+                    'antilink_enabled': False,
+                    'antilink_punishment': 'delete',
+                    'antilink_timeout': 600,
+                    'antiinvite_enabled': False,
+                    'antiinvite_punishment': 'delete',
+                    'antiinvite_timeout': 600,
+                    'exempt_channels': [],
+                    'exempt_roles': [],
+                    'log_channel': None,
+                    'blocked_words': [],
+                    'word_filter': False,
+                    'word_filter_timeout': 600,
+                    'word_filter_punishment': 'delete',
+                    'antispam_exempt_channels': [],
+                    'antispam_exempt_roles': [],
+                    'antilink_exempt_channels': [],
+                    'antilink_exempt_roles': [],
+                    'antiinvite_exempt_channels': [],
+                    'antiinvite_exempt_roles': [],
+                    'word_filter_exempt_channels': [],
+                    'word_filter_exempt_roles': [],
+                    'multiline_enabled': False,
+                    'multiline_max_lines': 10,
+                    'multiline_punishment': 'delete',
+                    'multiline_timeout': 600
+                }
+
+    def is_exempt(self, member, settings, module_type=None):
+        """Check if user is exempt from automod (globally or module-specific)"""
+        # Check if user has manage server permission (always exempt globally)
+        if member.guild_permissions.manage_guild:
+            return True
+
+        # Check global exemptions first
+        member_role_ids = [str(role.id) for role in member.roles]
+        for exempt_role_id in settings['exempt_roles']:
+            if exempt_role_id in member_role_ids:
+                return True
+
+        # Check module-specific exemptions if module type is specified
+        if module_type:
+            module_exempt_roles_key = f"{module_type}_exempt_roles"
+            if module_exempt_roles_key in settings:
+                module_exempt_roles = settings[module_exempt_roles_key]
+                if isinstance(module_exempt_roles, str):
+                    module_exempt_roles = [role.strip() for role in module_exempt_roles.split(',') if role.strip()]
+
+                for exempt_role_id in module_exempt_roles:
+                    if exempt_role_id in member_role_ids:
+                        return True
+
+        return False
+
+    def is_channel_exempt(self, channel_id, settings, module_type=None):
+        """Check if channel is exempt from automod (globally or module-specific)"""
+        channel_id_str = str(channel_id)
+
+        # Check global exemptions first
+        if channel_id_str in settings['exempt_channels']:
+            return True
+
+        # Check module-specific exemptions if module type is specified
+        if module_type:
+            module_exempt_channels_key = f"{module_type}_exempt_channels"
+            if module_exempt_channels_key in settings:
+                module_exempt_channels = settings[module_exempt_channels_key]
+                if isinstance(module_exempt_channels, str):
+                    module_exempt_channels = [ch.strip() for ch in module_exempt_channels.split(',') if ch.strip()]
+
+                if channel_id_str in module_exempt_channels:
+                    return True
+
+        return False
+
+    async def log_action(self, guild_id, user_id, action_type, punishment, details=""):
+        """Log automod action to database"""
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            await db.execute("""
+                INSERT INTO automod_logs (guild_id, user_id, action_type, timestamp, punishment, details)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (guild_id, user_id, action_type, datetime.now(timezone.utc).isoformat(), punishment, details))
+            await db.commit()
+
+    def get_violation_emoji(self, rule_name):
+        """Get the specific emoji for each violation type"""
+        emoji_map = {
+            "spam detection": "<:spam:1406285746263949313>",
+            "discord invite": "<:ppl:1406286276641951744><:discord:1406288378953203874>",
+            "blacklisted word": "<:filter:1406287044032073739>",
+            "blacklisted word (regex)": "<:filter:1406287044032073739>",
+            "multiline text": "<:linefil:1406288034651176972>",
+            "unauthorized link": "<:link:1406286640820785303>"
+        }
+        return emoji_map.get(rule_name, "<:filter:1406287044032073739>")
+
+    def create_automod_embed(self, user, rule, punishment):
+        """Create standardized automod violation embed"""
+        emoji = self.get_violation_emoji(rule)
+        embed = discord.Embed(
+            description=f"{emoji} {user.mention} violated the **{rule}** rule for automod.\nTheir punishment is: **{punishment}**",
+            color=0xFF6B6B
+        )
+        embed.set_footer(text=f"{self.bot.user.name}#{self.bot.user.discriminator}", icon_url=self.bot.user.avatar.url if self.bot.user.avatar else self.bot.user.default_avatar.url)
+        return embed
+
+    async def send_automod_dm(self, user: discord.Member, rule_name: str, punishment: str, guild: discord.Guild):
+        """Send DM notification to user about automod violation"""
+        try:
+            embed = create_embed(
+                title="automod violation",
+                description=f"you violated an automod rule in **{guild.name}**",
+                color=0xFF6B6B
+            )
+
+            # Parse rule name for user-friendly description
+            rule_description = "broke server rules"
+            if "spam" in rule_name.lower():
+                rule_description = "sent too many messages too quickly"
+            elif "link" in rule_name.lower():
+                rule_description = "posted an unauthorized link"
+            elif "invite" in rule_name.lower():
+                rule_description = "posted a Discord invite"
+            elif "word" in rule_name.lower():
+                rule_description = "used prohibited language"
+            elif "multiline" in rule_name.lower():
+                rule_description = "sent a message with too many lines"
+
+            embed.add_field(name="rule violated", value=f"**{rule_name}**", inline=True)
+            embed.add_field(name="punishment applied", value=punishment, inline=True)
+            embed.add_field(name="what you did", value=rule_description, inline=False)
+
+            embed.add_field(
+                name="why this happened",
+                value="this action was taken automatically to maintain server safety and guidelines",
+                inline=False
+            )
+            embed.add_field(name="executed", value=f"<t:{int(datetime.now(timezone.utc).timestamp())}:R>", inline=True)
+
+            embed.set_footer(text=f"server: {guild.name}")
+
+            await user.send(embed=embed)
+
+        except discord.Forbidden:
+            # User has DMs disabled or blocked the bot
+            pass
+        except discord.HTTPException:
+            # Other error occurred
+            pass
+
+    async def delete_recent_messages(self, channel, user, seconds=15):
+        """Delete user's recent messages"""
+        try:
+            cutoff_time = datetime.now(timezone.utc) - timedelta(seconds=seconds)
+
+            def check(m):
+                return (m.author == user and 
+                       m.created_at > cutoff_time and 
+                       not m.pinned)
+
+            deleted = await channel.purge(limit=50, check=check)
+            return len(deleted)
+        except Exception as e:
+            logger.error(f"failed to delete recent messages: {e}")
+            return 0
+
+    async def apply_punishment(self, message, punishments, rule_name, settings):
+        """Apply multiple punishments for automod violation"""
+        user = message.author
+        guild = message.guild
+
+        # Handle single punishment or multiple punishments
+        if isinstance(punishments, str):
+            punishment_list = [p.strip().lower() for p in punishments.split(",") if p.strip()]
+        else:
+            punishment_list = [punishments]
+
+        # Delete recent messages first
+        deleted_count = await self.delete_recent_messages(message.channel, user, 15)
+        punishment_results = []
+
+        # Get timeout duration from settings based on rule type
+        timeout_duration = 600  # default
+        if rule_name == "spam detection":
+            timeout_duration = int(settings.get('antispam_timeout', 600))
+        elif rule_name == "unauthorized link":
+            timeout_duration = int(settings.get('antilink_timeout', 600))
+        elif rule_name == "discord invite":
+            timeout_duration = int(settings.get('antiinvite_timeout', 600))
+        elif rule_name == "blacklisted word" or rule_name == "blacklisted word (regex)":
+            timeout_duration = int(settings.get('word_filter_timeout', 600))
+        elif rule_name == "multiline text":
+            timeout_duration = int(settings.get('multiline_timeout', 600))
+
+        # Apply each punishment
+        for punishment in punishment_list:
+            try:
+                if punishment == "timeout":
+                    logger.info(f"Applying timeout: {timeout_duration}s for rule: {rule_name} to user: {user.id}")
+                    await user.timeout(timedelta(seconds=timeout_duration), reason=f"automod: {rule_name}")
+                    punishment_results.append(f"timeout ({timeout_duration}s)")
+                elif punishment == "kick":
+                    await user.kick(reason=f"automod: {rule_name}")
+                    punishment_results.append("kick")
+                elif punishment == "ban":
+                    await user.ban(reason=f"automod: {rule_name}")
+                    punishment_results.append("ban")
+                elif punishment == "warn":
+                    try:
+                        from db import add_warning
+                        await add_warning(guild.id, user.id, self.bot.user.id, f"automod: {rule_name}")
+                        punishment_results.append("warned")
+                    except Exception:
+                        punishment_results.append("warned (failed)")
+                elif punishment == "delete":
+                    punishment_results.append("message deleted")
+            except discord.Forbidden:
+                punishment_results.append(f"{punishment} (no permission)")
+            except Exception as e:
+                punishment_results.append(f"{punishment} (failed)")
+
+        if deleted_count > 0:
+            punishment_results.append(f"{deleted_count} recent messages deleted")
+
+        punishment_text = " + ".join(punishment_results)
+
+        # Send DM notification to violator
+        await self.send_automod_dm(user, rule_name, punishment_text, guild)
+
+        # Log action
+        await self.log_action(guild.id, user.id, rule_name, punishment_text, message.content[:100])
+
+        # Send violation embed with 5 second auto-deletion to prevent flooding
+        # This gives brief notification then disappears to keep chat clean
+        embed = self.create_automod_embed(user, rule_name, punishment_text)
+        try:
+            await message.channel.send(embed=embed, delete_after=5)
+        except discord.Forbidden:
+            # If we can't send messages, just log it
+            logger.info(f"Unable to send automod notification in {message.channel.id} - {rule_name} applied to {user.id}")
+        except Exception as e:
+            logger.error(f"Error sending automod embed: {e}")
+
+        # Send to log channel if configured
+        if settings['log_channel']:
+            log_channel = guild.get_channel(settings['log_channel'])
+            if log_channel:
+                log_embed = discord.Embed(
+                    title="automod action",
+                    color=0xFF6B6B
+                )
+                log_embed.add_field(name="user", value=f"{user} ({user.id})", inline=True)
+                log_embed.add_field(name="channel", value=message.channel.mention, inline=True)
+                log_embed.add_field(name="rule", value=rule_name, inline=True)
+                log_embed.add_field(name="punishment", value=punishment_text, inline=True)
+                log_embed.add_field(name="message", value=message.content[:500] or "no content", inline=False)
+                log_embed.add_field(name="executed", value=f"<t:{int(datetime.now(timezone.utc).timestamp())}:R>", inline=True)
+
+                try:
+                    await log_channel.send(embed=log_embed)
+                except:
+                    pass
+
+    async def process_message(self, message):
+        """Process message for automod violations"""
+        settings = await self.get_automod_settings(message.guild.id)
+
+        # Check if user is globally exempt
+        if isinstance(message.author, discord.Member) and self.is_exempt(message.author, settings):
+            return
+
+        # Check for violations with module-specific exemptions
+        if settings['word_filter']:
+            if not (self.is_channel_exempt(message.channel.id, settings, 'word_filter') or 
+                    (isinstance(message.author, discord.Member) and 
+                     self.is_exempt(message.author, settings, 'word_filter'))):
+                await self.check_word_filter(message, settings)
+
+        # Check multiline text filter
+        if settings.get('multiline_enabled', False):
+            if not (self.is_channel_exempt(message.channel.id, settings, 'multiline') or 
+                    (isinstance(message.author, discord.Member) and 
+                     self.is_exempt(message.author, settings, 'multiline'))):
+                await self.check_multiline(message, settings)
+
+        if settings['antispam_enabled']:
+            if not (self.is_channel_exempt(message.channel.id, settings, 'antispam') or 
+                    (isinstance(message.author, discord.Member) and 
+                     self.is_exempt(message.author, settings, 'antispam'))):
+                await self.check_spam(message, settings)
+
+        if settings['antilink_enabled']:
+            if not (self.is_channel_exempt(message.channel.id, settings, 'antilink') or 
+                    (isinstance(message.author, discord.Member) and 
+                     self.is_exempt(message.author, settings, 'antilink'))):
+                await self.check_links(message, settings)
+
+        if settings['antiinvite_enabled']:
+            if not (self.is_channel_exempt(message.channel.id, settings, 'antiinvite') or 
+                    (isinstance(message.author, discord.Member) and 
+                     self.is_exempt(message.author, settings, 'antiinvite'))):
+                await self.check_invites(message, settings)
+
+    @commands.Cog.listener()
+    async def on_message(self, message):
+        """Monitor messages for automod violations"""
+        if message.author.bot or not message.guild:
+            return
+
+        await self.process_message(message)
+
+    @commands.Cog.listener()
+    async def on_message_edit(self, before, after):
+        """Monitor edited messages for automod violations"""
+        if after.author.bot or not after.guild or before.content == after.content:
+            return
+
+        await self.process_message(after)
+
+    def normalize_text(self, text):
+        """Normalize text to detect bypass attempts"""
+        # Remove zalgo text and diacritics
+        text = self.zalgo_pattern.sub('', text)
+        text = unicodedata.normalize('NFD', text)
+        text = ''.join(c for c in text if unicodedata.category(c) != 'Mn')
+
+        # Convert to lowercase
+        text = text.lower()
+
+        # Replace common substitutions (leetspeak, etc.)
+        for old_char, new_char in self.char_substitutions.items():
+            text = text.replace(old_char, new_char)
+
+        # Remove common separating characters that don't affect word meaning
+        separators = [' ', '-', '_', '.', 'â¢', 'Â·', 'â§', 'â', 'â']
+        for sep in separators:
+            text = text.replace(sep, '')
+
+        return text
+
+    def get_compiled_regex(self, pattern):
+        """Get compiled regex with caching for performance"""
+        if pattern in self.regex_cache:
+            return self.regex_cache[pattern]
+
+        try:
+            compiled = re.compile(pattern, re.IGNORECASE | re.MULTILINE | re.DOTALL | re.UNICODE)
+
+            # Manage cache size
+            if len(self.regex_cache) >= self.cache_max_size:
+                # Remove oldest entry
+                oldest_key = next(iter(self.regex_cache))
+                del self.regex_cache[oldest_key]
+
+            self.regex_cache[pattern] = compiled
+            return compiled
+        except re.error as e:
+            logger.error(f"Invalid regex pattern '{pattern}': {e}")
+            return None
+
+    async def check_word_filter(self, message, settings):
+        """Enhanced word filter with improved regex and bypass detection"""
+        if not settings['blocked_words']:
+            return
+
+        original_content = message.content
+        content_lower = original_content.lower()
+        normalized_content = self.normalize_text(original_content)
+
+        for word in settings['blocked_words']:
+            if not word or not word.strip():
+                continue
+
+            word = word.strip()
+
+            # Enhanced regex pattern detection
+            if word.startswith('/') and word.endswith('/') and len(word) > 2:
+                regex_pattern = word[1:-1]
+                compiled_regex = self.get_compiled_regex(regex_pattern)
+
+                if compiled_regex is None:
+                    continue
+
+                try:
+                    # Test against multiple versions of content for comprehensive detection
+                    test_strings = [original_content, content_lower, normalized_content]
+
+                    for test_content in test_strings:
+                        if compiled_regex.search(test_content):
+                            await self.apply_punishment(
+                                message, 
+                                settings['word_filter_punishment'], 
+                                f"blacklisted word (regex: {regex_pattern[:50]}{'...' if len(regex_pattern) > 50 else ''})", 
+                                settings
+                            )
+                            return
+
+                except Exception as e:
+                    logger.error(f"Error processing regex pattern {word}: {e}")
+                    continue
+            else:
+                # Enhanced word matching with bypass detection
+                word_lower = word.lower()
+                normalized_word = self.normalize_text(word)
+
+                # Multiple detection methods
+                detection_methods = [
+                    # Method 1: Exact word boundaries (most strict)
+                    (r'\b' + re.escape(word_lower) + r'\b', content_lower),
+                    # Method 2: Substring in normalized text (bypass detection)
+                    (re.escape(normalized_word), normalized_content),
+                    # Method 3: Flexible pattern matching with optional separators
+                    (''.join(f'{re.escape(c)}[\\s\\-_\\.â¢Â·â§ââ]*' for c in word_lower)[:-13], content_lower),
+                    # Method 4: Simple substring (fallback)
+                    (re.escape(word_lower), content_lower)
+                ]
+
+                for pattern, test_content in detection_methods:
+                    try:
+                        match = re.search(pattern, test_content, re.IGNORECASE)
+                        if match:
+                            detection_type = "exact match" if pattern == r'\b' + re.escape(word_lower) + r'\b' else "bypass detected"
+
+                            # Log detailed match information for analytics
+                            match_info = {
+                                'original_word': word,
+                                'detected_text': match.group() if hasattr(match, 'group') else 'N/A',
+                                'detection_method': detection_type,
+                                'user_id': message.author.id,
+                                'channel_id': message.channel.id,
+                                'timestamp': datetime.now(timezone.utc).isoformat()
+                            }
+                            logger.info(f"Word filter match: {match_info}")
+
+                            await self.apply_punishment(
+                                message, 
+                                settings['word_filter_punishment'], 
+                                f"blacklisted word ({detection_type})", 
+                                settings
+                            )
+                            return
+                    except re.error:
+                        # Skip invalid patterns
+                        continue
+
+    async def check_spam(self, message, settings):
+        """Check for spam violations"""
+        user_id = message.author.id
+        channel_id = message.channel.id
+        current_time = datetime.now(timezone.utc)
+
+        # Add message to spam tracker
+        self.spam_tracker[user_id].append(current_time)
+
+        # Check if spam threshold exceeded
+        threshold = settings['antispam_threshold']
+        timeframe = settings['antispam_timeframe']
+
+        # Count messages within timeframe
+        cutoff_time = current_time - timedelta(seconds=timeframe)
+        recent_messages = [msg_time for msg_time in self.spam_tracker[user_id] if msg_time > cutoff_time]
+
+        if len(recent_messages) >= threshold:
+            await self.apply_punishment(message, settings['antispam_punishment'], "spam detection", settings)
+            # Clear tracker to prevent repeated punishments
+            self.spam_tracker[user_id].clear()
+
+    async def check_links(self, message, settings):
+        """Enhanced link detection with improved patterns"""
+        # Test against normalized content to catch bypasses
+        test_contents = [message.content, self.normalize_text(message.content)]
+
+        for content in test_contents:
+            match = self.url_pattern.search(content)
+            if match:
+                # Extract and log detected URL for analytics
+                detected_url = match.group()
+                logger.info(f"Link detected: {detected_url[:100]} by user {message.author.id}")
+                await self.apply_punishment(message, settings['antilink_punishment'], "unauthorized link", settings)
+                return
+
+    async def check_invites(self, message, settings):
+        """Enhanced invite detection with improved patterns"""
+        # Test against normalized content to catch bypasses
+        test_contents = [message.content, self.normalize_text(message.content)]
+
+        for content in test_contents:
+            match = self.invite_pattern.search(content)
+            if match:
+                # Extract and log detected invite for analytics
+                detected_invite = match.group()
+                logger.info(f"Invite detected: {detected_invite} by user {message.author.id}")
+                await self.apply_punishment(message, settings['antiinvite_punishment'], "discord invite", settings)
+                return
+
+    async def check_multiline(self, message, settings):
+        """Check for excessive multiline text"""
+        max_lines = settings.get('multiline_max_lines', 10)
+        line_count = message.content.count('\n') + 1
+
+        if line_count > max_lines:
+            punishment = settings.get('multiline_punishment', 'delete')
+            await self.apply_punishment(message, punishment, "multiline text", settings)
+
+async def setup(bot):
+    await bot.add_cog(AutoMod(bot))
