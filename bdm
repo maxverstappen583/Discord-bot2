@@ -1,0 +1,429 @@
+import discord
+from discord.ext import commands, tasks
+from discord import app_commands
+from utils import *
+import aiosqlite
+from datetime import datetime, timedelta, timezone
+import asyncio
+import logging
+
+logger = logging.getLogger(__name__)
+
+class BulkDeleteCog(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+        self.bulk_delete_channels = {}  # {channel_id: {'count': int, 'interval': seconds, 'last_delete': datetime}}
+        self.bulk_delete_task.start()
+        
+    def cog_unload(self):
+        self.bulk_delete_task.cancel()
+    
+    async def setup_bdm_tables(self):
+        """Initialize bulk delete tables in database"""
+        async with aiosqlite.connect('bot.db') as db:
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS bulk_delete_channels (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    guild_id INTEGER,
+                    channel_id INTEGER,
+                    message_count INTEGER,
+                    interval_minutes INTEGER,
+                    log_channel_id INTEGER,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_deletion TIMESTAMP,
+                    UNIQUE(guild_id, channel_id)
+                )
+            ''')
+            
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS bulk_delete_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    guild_id INTEGER,
+                    channel_id INTEGER,
+                    messages_deleted INTEGER,
+                    deleted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            await db.commit()
+            
+            # Load existing configurations
+            cursor = await db.execute('SELECT channel_id, message_count, interval_minutes, last_deletion FROM bulk_delete_channels')
+            configs = await cursor.fetchall()
+            for channel_id, count, interval, last_delete in configs:
+                last_delete_time = datetime.fromisoformat(last_delete) if last_delete else datetime.now(timezone.utc)
+                self.bulk_delete_channels[channel_id] = {
+                    'count': count, 
+                    'interval': interval * 60,  # Convert to seconds
+                    'last_delete': last_delete_time
+                }
+    
+    @commands.hybrid_group(name='bdm')
+    @commands.has_permissions(manage_channels=True)
+    async def bdm(self, ctx):
+        """bulk message deletion system"""
+        if ctx.invoked_subcommand is None:
+            import sys; sys.path.append("."); from utils import create_command_usage_embed
+            prefix = await self.bot.get_guild_prefix(ctx.guild.id) if ctx.guild else ";"
+            embed = create_command_usage_embed(
+                self.bot, 
+                "bdm", 
+                "bulk message deletion system", 
+                "bdm", 
+                "bdm <set|unset|status|logs>",
+                prefix
+            )
+            await ctx.send(embed=embed, ephemeral=True)
+    
+    @bdm.command(name='set')
+    @app_commands.describe(
+        channel="the channel where messages should be bulk deleted",
+        count="number of messages to delete each time (max 100)",
+        interval="interval in minutes between deletions (min 5m, max 24h)",
+        log_channel="optional: channel to send deletion logs to"
+    )
+    async def set_bulk_delete(self, ctx, channel: discord.TextChannel = None, count: int = None, interval: str = None, log_channel: discord.TextChannel = None):
+        """enable bulk message deletion in a channel"""
+        await self.setup_bdm_tables()
+        
+        if not channel or not count or not interval:
+            import sys; sys.path.append("."); from utils import create_command_usage_embed
+            prefix = await self.bot.get_guild_prefix(ctx.guild.id) if ctx.guild else "."
+            embed = create_command_usage_embed(
+                self.bot, 
+                "bdm set", 
+                "enable bulk message deletion in a channel", 
+                "bdm set", 
+                "bdm set <#channel> <count> <interval> [#log_channel]",
+                prefix
+            )
+            await ctx.send(embed=embed, ephemeral=True)
+            return
+        
+        # Validate count
+        if count < 1 or count > 100:
+            embed = create_embed("invalid count", "message count must be between 1 and 100")
+            await ctx.send(embed=embed, ephemeral=True)
+            return
+        
+        # Parse interval
+        try:
+            if interval.endswith('m'):
+                total_minutes = int(interval[:-1])
+            elif interval.endswith('h'):
+                total_minutes = int(interval[:-1]) * 60
+            else:
+                raise ValueError("invalid format")
+        except ValueError:
+            embed = create_embed("invalid interval", "interval must end with 'm' (minutes) or 'h' (hours). example: 30m or 2h")
+            await ctx.send(embed=embed, ephemeral=True)
+            return
+        
+        if total_minutes < 5:  # 5 minutes minimum
+            embed = create_embed("interval too short", "minimum interval is 5 minutes")
+            await ctx.send(embed=embed, ephemeral=True)
+            return
+            
+        if total_minutes > 1440:  # 24 hours max
+            embed = create_embed("interval too long", "maximum interval is 24 hours")
+            await ctx.send(embed=embed, ephemeral=True)
+            return
+        
+        # Store in database
+        async with aiosqlite.connect('bot.db') as db:
+            await db.execute('''
+                INSERT OR REPLACE INTO bulk_delete_channels 
+                (guild_id, channel_id, message_count, interval_minutes, log_channel_id, last_deletion)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (ctx.guild.id, channel.id, count, total_minutes, log_channel.id if log_channel else None, datetime.now(timezone.utc).isoformat()))
+            await db.commit()
+        
+        # Update memory
+        self.bulk_delete_channels[channel.id] = {
+            'count': count, 
+            'interval': total_minutes * 60,  # Convert to seconds
+            'last_delete': datetime.now(timezone.utc)
+        }
+        
+        log_info = f" â¢ logs to {log_channel.mention}" if log_channel else ""
+        embed = create_embed("bulk delete enabled", 
+                           f"{count} messages in {channel.mention} will be deleted every {interval}{log_info}")
+        await ctx.send(embed=embed)
+    
+    @bdm.command(name='unset')
+    @app_commands.describe(channel="the channel to disable bulk deletion for")
+    async def unset_bulk_delete(self, ctx, channel: discord.TextChannel = None):
+        """disable bulk message deletion in a channel"""
+        await self.setup_bdm_tables()
+        
+        if not channel:
+            import sys; sys.path.append("."); from utils import create_command_usage_embed
+            prefix = await self.bot.get_guild_prefix(ctx.guild.id) if ctx.guild else "."
+            embed = create_command_usage_embed(
+                self.bot, 
+                "bdm unset", 
+                "disable bulk message deletion in a channel.", 
+                "bdm unset", 
+                "bdm unset <#channel>",
+                prefix
+            )
+            await ctx.send(embed=embed, ephemeral=True)
+            return
+        
+        async with aiosqlite.connect('bot.db') as db:
+            cursor = await db.execute('''
+                DELETE FROM bulk_delete_channels WHERE guild_id = ? AND channel_id = ?
+            ''', (ctx.guild.id, channel.id))
+            await db.commit()
+            
+            if cursor.rowcount == 0:
+                embed = create_embed("not configured", f"{channel.mention} doesn't have bulk delete enabled")
+                await ctx.send(embed=embed, ephemeral=True)
+                return
+        
+        # Remove from memory
+        if channel.id in self.bulk_delete_channels:
+            del self.bulk_delete_channels[channel.id]
+        
+        embed = create_embed("bulk delete disabled", f"disabled bulk deletion in {channel.mention}")
+        await ctx.send(embed=embed)
+    
+    @bdm.command(name='status')
+    async def status_bulk_delete(self, ctx):
+        """show bulk delete status for this server"""
+        await self.setup_bdm_tables()
+        
+        async with aiosqlite.connect('bot.db') as db:
+            cursor = await db.execute('''
+                SELECT channel_id, message_count, interval_minutes, log_channel_id, last_deletion FROM bulk_delete_channels 
+                WHERE guild_id = ?
+            ''', (ctx.guild.id,))
+            configs = await cursor.fetchall()
+        
+        if not configs:
+            embed = create_embed("no bulk delete channels", "no channels have bulk deletion enabled")
+            await ctx.send(embed=embed)
+            return
+        
+        description = ""
+        for channel_id, count, interval, log_channel_id, last_delete in configs:
+            channel = ctx.guild.get_channel(channel_id)
+            log_channel = ctx.guild.get_channel(log_channel_id) if log_channel_id else None
+            
+            if channel:
+                interval_str = f"{interval}m" if interval < 60 else f"{interval//60}h"
+                log_info = f" â {log_channel.mention}" if log_channel else ""
+                last_delete_str = ""
+                if last_delete:
+                    last_delete_time = datetime.fromisoformat(last_delete)
+                    last_delete_str = f" (last: {last_delete_time.strftime('%m/%d %H:%M')})"
+                description += f"{channel.mention} - {count} msgs every {interval_str}{log_info}{last_delete_str}\n"
+        
+        embed = create_embed("bulk delete status", description.strip() if description else "no valid channels found")
+        await ctx.send(embed=embed)
+    
+    @bdm.command(name='logs')
+    @app_commands.describe(
+        channel="the channel to view bulk deletion logs for",
+        limit="number of recent deletions to show (default: 10, max: 50)"
+    )
+    async def logs_bulk_delete(self, ctx, channel: discord.TextChannel = None, limit: int = 10):
+        """view recent bulk deletions"""
+        await self.setup_bdm_tables()
+        
+        if not channel:
+            import sys; sys.path.append("."); from utils import create_command_usage_embed
+            prefix = await self.bot.get_guild_prefix(ctx.guild.id) if ctx.guild else "."
+            embed = create_command_usage_embed(
+                self.bot, 
+                "bdm logs", 
+                "view recent bulk deletions.", 
+                "bdm logs", 
+                "bdm logs <#channel> [limit]",
+                prefix
+            )
+            await ctx.send(embed=embed, ephemeral=True)
+            return
+        
+        if limit > 50:
+            limit = 50
+        elif limit < 1:
+            limit = 10
+        
+        async with aiosqlite.connect('bot.db') as db:
+            cursor = await db.execute('''
+                SELECT messages_deleted, deleted_at FROM bulk_delete_logs 
+                WHERE guild_id = ? AND channel_id = ?
+                ORDER BY deleted_at DESC LIMIT ?
+            ''', (ctx.guild.id, channel.id, limit))
+            logs = await cursor.fetchall()
+        
+        if not logs:
+            embed = create_embed("no logs found", f"no bulk deletions found for {channel.mention}")
+            await ctx.send(embed=embed)
+            return
+        
+        description = ""
+        for messages_deleted, deleted_at in logs:
+            timestamp = datetime.fromisoformat(deleted_at).strftime("%m/%d %H:%M")
+            description += f"`{timestamp}` deleted **{messages_deleted}** messages\n"
+        
+        embed = create_embed(f"bulk delete logs - {channel.name}", description.strip())
+        embed.add_field(name="note", value=f"showing last {len(logs)} bulk deletions", inline=False)
+        await ctx.send(embed=embed)
+    
+    @bdm.command(name='force')
+    @app_commands.describe(channel="channel to force bulk delete in now")
+    async def force_bulk_delete(self, ctx, channel: discord.TextChannel = None):
+        """force a bulk deletion now (ignores timer)"""
+        await self.setup_bdm_tables()
+        
+        if not channel:
+            import sys; sys.path.append("."); from utils import create_command_usage_embed
+            prefix = await self.bot.get_guild_prefix(ctx.guild.id) if ctx.guild else "."
+            embed = create_command_usage_embed(
+                self.bot, 
+                "bdm force", 
+                "force a bulk deletion now (ignores timer).", 
+                "bdm force", 
+                "bdm force <#channel>",
+                prefix
+            )
+            await ctx.send(embed=embed, ephemeral=True)
+            return
+        
+        async with aiosqlite.connect('bot.db') as db:
+            cursor = await db.execute('''
+                SELECT message_count FROM bulk_delete_channels 
+                WHERE guild_id = ? AND channel_id = ?
+            ''', (ctx.guild.id, channel.id))
+            result = await cursor.fetchone()
+            
+            if not result:
+                embed = create_embed("not configured", f"{channel.mention} doesn't have bulk delete enabled")
+                await ctx.send(embed=embed, ephemeral=True)
+                return
+        
+        count = result[0]
+        deleted_count = await self.perform_bulk_deletion(channel, count)
+        
+        if deleted_count > 0:
+            embed = create_embed("bulk deletion completed", f"deleted {deleted_count} messages from {channel.mention}")
+            await ctx.send(embed=embed)
+        else:
+            embed = create_embed("no messages deleted", f"no messages found to delete in {channel.mention}")
+            await ctx.send(embed=embed, ephemeral=True)
+    
+    @tasks.loop(minutes=1)
+    async def bulk_delete_task(self):
+        """Check for channels that need bulk deletion"""
+        current_time = datetime.now(timezone.utc)
+        
+        # Reload configurations from database
+        await self.setup_bdm_tables()
+        
+        for channel_id, config in self.bulk_delete_channels.items():
+            time_since_last = (current_time - config['last_delete']).total_seconds()
+            
+            if time_since_last >= config['interval']:
+                channel = self.bot.get_channel(channel_id)
+                if channel:
+                    deleted_count = await self.perform_bulk_deletion(channel, config['count'])
+                    
+                    if deleted_count > 0:
+                        # Update last deletion time
+                        config['last_delete'] = current_time
+                        
+                        # Update database
+                        async with aiosqlite.connect('bot.db') as db:
+                            await db.execute('''
+                                UPDATE bulk_delete_channels 
+                                SET last_deletion = ? 
+                                WHERE channel_id = ?
+                            ''', (current_time.isoformat(), channel_id))
+                            await db.commit()
+                        
+                        # Send to log channel if configured
+                        await self.send_deletion_log(channel, deleted_count)
+    
+    async def perform_bulk_deletion(self, channel, count):
+        """Perform the actual bulk deletion"""
+        try:
+            # Get dynamic prefix to avoid deleting command messages
+            prefix = "."
+            try:
+                if hasattr(self.bot, 'get_prefix'):
+                    # Create a mock message to get prefix
+                    class MockMessage:
+                        def __init__(self, guild):
+                            self.guild = guild
+                    
+                    mock_msg = MockMessage(channel.guild)
+                    prefix_result = await self.bot.get_prefix(mock_msg)
+                    if isinstance(prefix_result, str):
+                        prefix = prefix_result
+                    elif isinstance(prefix_result, list) and prefix_result:
+                        prefix = prefix_result[0]
+            except:
+                prefix = "."
+            
+            def check(m):
+                # Don't delete pinned messages or command messages
+                return not m.pinned and not m.content.startswith((prefix, '/', '!'))
+            
+            deleted = await channel.purge(limit=count, check=check)
+            deleted_count = len(deleted)
+            
+            # Log to database
+            if deleted_count > 0:
+                await self.log_bulk_deletion(channel.guild.id, channel.id, deleted_count)
+            
+            return deleted_count
+            
+        except discord.Forbidden:
+            logger.error(f"No permission to delete messages in {channel.name}")
+            return 0
+        except Exception as e:
+            logger.error(f"Error during bulk deletion in {channel.name}: {e}")
+            return 0
+    
+    async def log_bulk_deletion(self, guild_id, channel_id, count):
+        """Log bulk deletion to database"""
+        async with aiosqlite.connect('bot.db') as db:
+            await db.execute('''
+                INSERT INTO bulk_delete_logs (guild_id, channel_id, messages_deleted)
+                VALUES (?, ?, ?)
+            ''', (guild_id, channel_id, count))
+            await db.commit()
+    
+    async def send_deletion_log(self, channel, count):
+        """Send bulk deletion log to configured log channel"""
+        async with aiosqlite.connect('bot.db') as db:
+            cursor = await db.execute('''
+                SELECT log_channel_id FROM bulk_delete_channels 
+                WHERE guild_id = ? AND channel_id = ?
+            ''', (channel.guild.id, channel.id))
+            result = await cursor.fetchone()
+            
+            if result and result[0]:
+                log_channel = channel.guild.get_channel(result[0])
+                if log_channel:
+                    embed = discord.Embed(
+                        title="bulk messages deleted",
+                        description=f"**channel:** {channel.mention}\n**messages deleted:** {count}",
+                        color=0x00ff00,
+                        timestamp=datetime.now(timezone.utc)
+                    )
+                    embed.set_footer(text="BDM system")
+                    
+                    try:
+                        await log_channel.send(embed=embed)
+                    except discord.Forbidden:
+                        pass
+    
+    @bulk_delete_task.before_loop
+    async def before_bulk_delete_task(self):
+        await self.bot.wait_until_ready()
+        await self.setup_bdm_tables()
+
+async def setup(bot):
+    await bot.add_cog(BulkDeleteCog(bot))
