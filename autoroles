@@ -1,0 +1,211 @@
+mport discord
+from discord.ext import commands
+from discord import app_commands
+import asyncio
+from db import *
+from utils import *
+
+class AutoRoles(commands.Cog):
+    """Auto role assignment system"""
+    
+    def __init__(self, bot):
+        self.bot = bot
+    
+    @commands.Cog.listener()
+    async def on_member_join(self, member):
+        """Handle auto role assignment when member joins"""
+        # Get auto roles for this guild
+        auto_roles = await self.get_auto_roles(member.guild.id)
+        
+        if auto_roles:
+            for role_id in auto_roles:
+                role = member.guild.get_role(role_id)
+                if role and role < member.guild.me.top_role:
+                    try:
+                        await member.add_roles(role, reason="auto role on join")
+                    except discord.Forbidden:
+                        pass
+    
+    async def get_auto_roles(self, guild_id: int) -> list:
+        """Get auto roles for guild"""
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            async with db.execute(
+                "SELECT role_id FROM auto_roles WHERE guild_id = ?",
+                (guild_id,)
+            ) as cursor:
+                return [row[0] for row in await cursor.fetchall()]
+    
+    async def add_auto_role(self, guild_id: int, role_id: int):
+        """Add auto role for guild"""
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            await db.execute(
+                "INSERT OR IGNORE INTO auto_roles (guild_id, role_id) VALUES (?, ?)",
+                (guild_id, role_id)
+            )
+            await db.commit()
+    
+    async def remove_auto_role(self, guild_id: int, role_id: int):
+        """Remove auto role for guild"""
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            await db.execute(
+                "DELETE FROM auto_roles WHERE guild_id = ? AND role_id = ?",
+                (guild_id, role_id)
+            )
+            await db.commit()
+    
+    @commands.hybrid_group(name="autorole", invoke_without_command=True)
+    @is_mod_or_higher()
+    async def autorole(self, ctx):
+        """auto role system commands"""
+        if ctx.invoked_subcommand is None:
+            import sys; sys.path.append("."); from utils import create_command_usage_embed
+            prefix = await self.bot.get_guild_prefix(ctx.guild.id) if ctx.guild else "."
+            embed = create_command_usage_embed(
+                self.bot, 
+                "autorole", 
+                "auto role system commands.", 
+                "autorole", 
+                "autorole <add|remove|list>",
+                prefix
+            )
+            await ctx.send(embed=embed, ephemeral=True)
+    
+    @autorole.command(name="add")
+    @app_commands.describe(role="role to automatically assign on join")
+    @is_mod_or_higher()
+    async def autorole_add(self, ctx, role: discord.Role):
+        """add a role to be automatically assigned on join"""
+        # Permission checks
+        if role >= ctx.author.top_role and ctx.author != ctx.guild.owner:
+            await ctx.send(embed=create_error_embed("you cannot add a role equal to or higher than your top role"), ephemeral=True)
+            return
+        
+        if role >= ctx.guild.me.top_role:
+            await ctx.send(embed=create_error_embed("i cannot assign a role equal to or higher than my top role"), ephemeral=True)
+            return
+        
+        if role == ctx.guild.default_role:
+            await ctx.send(embed=create_error_embed("cannot add the default role"), ephemeral=True)
+            return
+        
+        # Check if already an auto role
+        auto_roles = await self.get_auto_roles(ctx.guild.id)
+        if role.id in auto_roles:
+            await ctx.send(embed=create_error_embed("that role is already an auto role"), ephemeral=True)
+            return
+        
+        # Add auto role
+        await self.add_auto_role(ctx.guild.id, role.id)
+        
+        embed = create_success_embed(f"added {role.mention} as an auto role")
+        embed.add_field(name="note", value="new members will automatically receive this role when they join", inline=False)
+        await ctx.send(embed=embed, ephemeral=True)
+    
+    @autorole.command(name="remove")
+    @app_commands.describe(role="role to remove from auto assignment")
+    @is_mod_or_higher()
+    async def autorole_remove(self, ctx, role: discord.Role):
+        """remove a role from automatic assignment"""
+        # Check if it's an auto role
+        auto_roles = await self.get_auto_roles(ctx.guild.id)
+        if role.id not in auto_roles:
+            await ctx.send(embed=create_error_embed("that role is not an auto role"), ephemeral=True)
+            return
+        
+        # Remove auto role
+        await self.remove_auto_role(ctx.guild.id, role.id)
+        
+        embed = create_success_embed(f"removed {role.mention} from auto roles")
+        await ctx.send(embed=embed, ephemeral=True)
+    
+    @autorole.command(name="list")
+    @is_mod_or_higher()
+    async def autorole_list(self, ctx):
+        """list all auto roles for this server"""
+        auto_roles = await self.get_auto_roles(ctx.guild.id)
+        
+        if not auto_roles:
+            await ctx.send(embed=create_embed(description="no auto roles configured"), ephemeral=True)
+            return
+        
+        embed = create_embed(
+            title="auto roles",
+            description=f"roles automatically assigned on join ({len(auto_roles)} total)"
+        )
+        
+        role_list = []
+        for role_id in auto_roles:
+            role = ctx.guild.get_role(role_id)
+            if role:
+                role_list.append(f"{role.mention} - {role.name}")
+            else:
+                # Clean up deleted roles
+                await self.remove_auto_role(ctx.guild.id, role_id)
+        
+        if role_list:
+            embed.add_field(name="roles", value="\n".join(role_list), inline=False)
+        else:
+            embed.description = "no valid auto roles found"
+        
+        await ctx.send(embed=embed, ephemeral=True)
+    
+    @autorole.command(name="assign")
+    @app_commands.describe(role="role to assign to all current members")
+    @is_admin()
+    async def autorole_assign(self, ctx, role: discord.Role):
+        """assign a role to all current members in the server"""
+        # Permission checks
+        if role >= ctx.author.top_role and ctx.author != ctx.guild.owner:
+            await ctx.send(embed=create_error_embed("you cannot assign a role equal to or higher than your top role"), ephemeral=True)
+            return
+        
+        if role >= ctx.guild.me.top_role:
+            await ctx.send(embed=create_error_embed("i cannot assign a role equal to or higher than my top role"), ephemeral=True)
+            return
+        
+        if role == ctx.guild.default_role:
+            await ctx.send(embed=create_error_embed("cannot assign the default role"), ephemeral=True)
+            return
+        
+        # Confirmation
+        members_without_role = [m for m in ctx.guild.members if role not in m.roles and not m.bot]
+        
+        if not members_without_role:
+            await ctx.send(embed=create_error_embed("all members already have that role"), ephemeral=True)
+            return
+        
+        confirmed = await confirmation_prompt(ctx, f"assign {role.mention} to **{len(members_without_role)}** members?")
+        
+        if not confirmed:
+            await ctx.send(embed=create_error_embed("role assignment cancelled"), ephemeral=True)
+            return
+        
+        # Assign roles
+        success_count = 0
+        failed_count = 0
+        
+        progress_embed = create_embed(
+            title="assigning roles",
+            description=f"assigning {role.mention} to {len(members_without_role)} members..."
+        )
+        message = await ctx.send(embed=progress_embed, ephemeral=True)
+        
+        for member in members_without_role:
+            try:
+                await member.add_roles(role, reason=f"bulk assignment by {ctx.author}")
+                success_count += 1
+            except discord.Forbidden:
+                failed_count += 1
+            except discord.HTTPException:
+                failed_count += 1
+        
+        # Update with results
+        result_embed = create_success_embed(f"role assignment completed")
+        result_embed.add_field(name="successful", value=success_count, inline=True)
+        result_embed.add_field(name="failed", value=failed_count, inline=True)
+        result_embed.add_field(name="role", value=role.mention, inline=True)
+        
+        await message.edit(embed=result_embed)
+
+async def setup(bot):
+    await bot.add_cog(AutoRoles(bot))
