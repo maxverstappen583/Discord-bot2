@@ -1,0 +1,2619 @@
+import discord
+from discord.ext import commands
+from discord import app_commands
+import asyncio
+import aiosqlite
+from datetime import datetime, timezone
+from db import *
+from utils import *
+import toml
+
+DATABASE_PATH = "bot.db"
+
+def load_config():
+    """Loads configuration from config.toml"""
+    try:
+        with open('config.toml', 'r') as f:
+            config = toml.load(f)
+            return config
+    except FileNotFoundError:
+        print("Error: config.toml not found.")
+        return {}
+    except Exception as e:
+        print(f"Error loading config.toml: {e}")
+        return {}
+
+CONFIG = load_config()
+
+def get_footer_data():
+    """Gets footer text and icon URL from config."""
+    footer_text = CONFIG.get('bot', {}).get('footer_text', 'those who know :skull:')
+    footer_icon_url = CONFIG.get('bot', {}).get('footer_icon_url', '')
+    return footer_text, footer_icon_url
+
+class AntiNukeModuleView(discord.ui.View):
+    """Interactive view for antinuke module management"""
+
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=180)
+        self.guild_id = guild_id
+
+    @discord.ui.select(
+        placeholder="Select module to configure...",
+        options=[
+            discord.SelectOption(
+                label="anti channel",
+                value="anti_channel",
+                description="prevents unauthorized channel creation/deletion/modification"
+            ),
+            discord.SelectOption(
+                label="anti role",
+                value="anti_role",
+                description="prevents unauthorized role creation/deletion/modification"
+            ),
+            discord.SelectOption(
+                label="anti bot",
+                value="anti_bot",
+                description="prevents unauthorized bot additions (kicks unverified bots)"
+            ),
+            discord.SelectOption(
+                label="anti member",
+                value="anti_member",
+                description="prevents unauthorized member kicks/bans"
+            ),
+            discord.SelectOption(
+                label="anti guild",
+                value="anti_guild",
+                description="prevents server settings changes, emoji operations, automod changes"
+            ),
+            discord.SelectOption(
+                label="anti webhook",
+                value="anti_webhook",
+                description="prevents unauthorized webhook creation/deletion"
+            ),
+             discord.SelectOption(
+                label="all events",
+                value="all_events",
+                description="enables all anti-nuke modules"
+            )
+        ]
+    )
+    async def module_select(self, interaction: discord.Interaction, select: discord.ui.Select):
+        """Handle module selection"""
+        module = select.values[0]
+        view = AntiNukeModuleConfigView(self.guild_id, module)
+
+        embed = create_embed(
+            title=f"configure {module.replace('_', ' ')}",
+            description="use the buttons below to enable/disable this module",
+            color=0xFF0000
+        )
+
+        # Get current status for selected module
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            if module == "all_events":
+                # Check if all modules are enabled
+                cursor = await db.execute(
+                    "SELECT anti_channel_enabled, anti_role_enabled, anti_bot_enabled, anti_member_enabled, anti_guild_enabled, anti_webhook_enabled FROM antinuke_settings WHERE guild_id = ?",
+                    (self.guild_id,)
+                )
+                result = await cursor.fetchone()
+                if result:
+                    enabled = all(bool(x) for x in result)
+                else:
+                    enabled = False
+            else:
+                cursor = await db.execute(
+                    f"SELECT {module}_enabled FROM antinuke_settings WHERE guild_id = ?",
+                    (self.guild_id,)
+                )
+                result = await cursor.fetchone()
+                enabled = bool(result[0]) if result else False
+
+        status = "enabled" if enabled else "disabled"
+        embed.title = f"{module.replace('_', ' ')} - {status}"
+        embed.color = 0x00FF00 if enabled else 0xFF0000
+
+        footer_text, footer_icon = get_footer_data()
+        if footer_icon:
+            embed.set_footer(text=footer_text, icon_url=footer_icon)
+        else:
+            embed.set_footer(text=footer_text)
+
+        await interaction.response.edit_message(embed=embed, view=view)
+
+class AntiNukeModuleConfigView(discord.ui.View):
+    """View for enabling/disabling specific modules"""
+
+    def __init__(self, guild_id: int, module: str):
+        super().__init__(timeout=180)
+        self.guild_id = guild_id
+        self.module = module
+
+    @discord.ui.button(label="enable", style=discord.ButtonStyle.success)
+    async def enable_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Enable the selected module"""
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            # Ensure the row exists first
+            await db.execute(
+                "INSERT OR IGNORE INTO antinuke_settings (guild_id) VALUES (?)",
+                (self.guild_id,)
+            )
+
+            if self.module == "all_events":
+                # Enable all modules
+                await db.execute("""
+                    UPDATE antinuke_settings SET 
+                    anti_channel_enabled = ?, anti_role_enabled = ?, anti_bot_enabled = ?, 
+                    anti_member_enabled = ?, anti_guild_enabled = ?, anti_webhook_enabled = ?
+                    WHERE guild_id = ?
+                """, (True, True, True, True, True, True, self.guild_id))
+            else:
+                # Enable specific module
+                await db.execute(
+                    f"UPDATE antinuke_settings SET {self.module}_enabled = ? WHERE guild_id = ?",
+                    (True, self.guild_id)
+                )
+            await db.commit()
+
+        if self.module == "all_events":
+            embed = create_success_embed("all antinuke modules enabled")
+            embed.add_field(name="maximum protection active", value="all unauthorized actions will be blocked and reversed", inline=False)
+        else:
+            embed = create_success_embed(f"{self.module.replace('_', ' ')} enabled")
+            embed.add_field(name="protection active", value="unauthorized actions will be blocked and reversed", inline=False)
+
+        embed.add_field(name="note", value="this applies to both humans and bots", inline=False)
+
+        footer_text, footer_icon = get_footer_data()
+        if footer_icon:
+            embed.set_footer(text=footer_text, icon_url=footer_icon)
+        else:
+            embed.set_footer(text=footer_text)
+
+        await interaction.response.edit_message(embed=embed, view=None)
+
+    @discord.ui.button(label="disable", style=discord.ButtonStyle.danger)
+    async def disable_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Disable the selected module"""
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            # Ensure the row exists first
+            await db.execute(
+                "INSERT OR IGNORE INTO antinuke_settings (guild_id) VALUES (?)",
+                (self.guild_id,)
+            )
+            # Then update the specific module
+            await db.execute(
+                f"UPDATE antinuke_settings SET {self.module}_enabled = ? WHERE guild_id = ?",
+                (False, self.guild_id)
+            )
+            await db.commit()
+
+        embed = create_warning_embed(f"{self.module.replace('_', ' ')} disabled")
+        embed.add_field(name="protection inactive", value="no protection is currently active for this module", inline=False)
+
+        footer_text, footer_icon = get_footer_data()
+        if footer_icon:
+            embed.set_footer(text=footer_text, icon_url=footer_icon)
+        else:
+            embed.set_footer(text=footer_text)
+
+        await interaction.response.edit_message(embed=embed, view=None)
+
+    @discord.ui.button(label="back", style=discord.ButtonStyle.secondary)
+    async def back_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Go back to module selection"""
+        view = AntiNukeModuleView(self.guild_id)
+
+        embed = create_embed(
+            title="antinuke module configuration",
+            description="select a module below to configure",
+            color=0xFF0000
+        )
+
+        embed.add_field(
+            name="available modules",
+            value="â¢ **anti channel** - channel protection system\nâ¢ **anti role** - role protection system\nâ¢ **anti bot** - bot protection system\nâ¢ **anti member** - member protection system\nâ¢ **anti guild** - server settings protection\nâ¢ **anti webhook** - webhook protection system\nâ¢ **all events** - enable all protection modules",
+            inline=False
+        )
+
+        footer_text, footer_icon = get_footer_data()
+        if footer_icon:
+            embed.set_footer(text=footer_text, icon_url=footer_icon)
+        else:
+            embed.set_footer(text=footer_text)
+
+        await interaction.response.edit_message(embed=embed, view=view)
+
+class AntiNukeWhitelistView(discord.ui.View):
+    """Interactive view for antinuke whitelist management"""
+
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=180)
+        self.guild_id = guild_id
+
+    @discord.ui.select(
+        placeholder="Select whitelist type...",
+        options=[
+            discord.SelectOption(
+                label="all events",
+                value="all_events",
+                description="whitelist user for all antinuke events"
+            ),
+            discord.SelectOption(
+                label="channel events",
+                value="channel_events", 
+                description="whitelist user for channel-related events only"
+            ),
+            discord.SelectOption(
+                label="role events",
+                value="role_events",
+                description="whitelist user for role-related events only"
+            ),
+            discord.SelectOption(
+                label="member events",
+                value="member_events",
+                description="whitelist user for member kick/ban events only"
+            ),
+             discord.SelectOption(
+                label="webhook events",
+                value="webhook_events",
+                description="whitelist user for webhook create/delete events only"
+            ),
+             discord.SelectOption(
+                label="guild events",
+                value="guild_events",
+                description="whitelist user for guild settings changes only"
+            )
+        ]
+    )
+    async def whitelist_type_select(self, interaction: discord.Interaction, select: discord.ui.Select):
+        """Handle whitelist type selection"""
+        whitelist_type = select.values[0]
+
+        embed = create_embed(
+            title=f"whitelist management - {whitelist_type.replace('_', ' ')}",
+            description="use the buttons below to manage whitelisted users",
+            color=0x00FF00
+        )
+
+        if whitelist_type == "all_events":
+            embed.add_field(
+                name="all events whitelist",
+                value="users whitelisted for all events are immune to all antinuke modules",
+                inline=False
+            )
+        elif whitelist_type == "channel_events":
+            embed.add_field(
+                name="channel events whitelist", 
+                value="users whitelisted for channel events can create/delete/modify channels without punishment",
+                inline=False
+            )
+        elif whitelist_type == "role_events":
+             embed.add_field(
+                name="role events whitelist",
+                value="users whitelisted for role events can create/delete/modify roles without punishment",
+                inline=False
+            )
+        elif whitelist_type == "member_events":
+             embed.add_field(
+                name="member events whitelist",
+                value="users whitelisted for member events can kick/ban members without punishment",
+                inline=False
+            )
+        elif whitelist_type == "webhook_events":
+             embed.add_field(
+                name="webhook events whitelist",
+                value="users whitelisted for webhook events can create/delete webhooks without punishment",
+                inline=False
+            )
+        elif whitelist_type == "guild_events":
+             embed.add_field(
+                name="guild events whitelist",
+                value="users whitelisted for guild events can modify server settings without punishment",
+                inline=False
+            )
+
+        footer_text, footer_icon = get_footer_data()
+        if footer_icon:
+            embed.set_footer(text=footer_text, icon_url=footer_icon)
+        else:
+            embed.set_footer(text=footer_text)
+
+        view = AntiNukeWhitelistConfigView(self.guild_id, whitelist_type)
+        await interaction.response.edit_message(embed=embed, view=view)
+
+class AntiNukeWhitelistConfigView(discord.ui.View):
+    """View for managing specific whitelist types"""
+
+    def __init__(self, guild_id: int, whitelist_type: str):
+        super().__init__(timeout=180)
+        self.guild_id = guild_id
+        self.whitelist_type = whitelist_type
+
+    @discord.ui.button(label="add user", style=discord.ButtonStyle.success)
+    async def add_user_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Show modal to add user to whitelist"""
+        modal = AddUserModal(self.guild_id, self.whitelist_type)
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="remove user", style=discord.ButtonStyle.danger)
+    async def remove_user_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Show modal to remove user from whitelist"""
+        modal = RemoveUserModal(self.guild_id, self.whitelist_type)
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="view list", style=discord.ButtonStyle.primary)
+    async def view_list_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Show whitelisted users"""
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            cursor = await db.execute(
+                "SELECT user_id, added_by, added_at, whitelist_type FROM antinuke_whitelist WHERE guild_id = ? AND (whitelist_type = ? OR whitelist_type = 'all_events')",
+                (self.guild_id, self.whitelist_type)
+            )
+            whitelist = await cursor.fetchall()
+
+        if not whitelist:
+            embed = create_error_embed("no users are whitelisted for this type")
+            footer_text, footer_icon = get_footer_data()
+            if footer_icon:
+                embed.set_footer(text=footer_text, icon_url=footer_icon)
+            else:
+                embed.set_footer(text=footer_text)
+            await interaction.response.edit_message(embed=embed, view=self)
+            return
+
+        embed = create_embed(title=f"whitelist - {self.whitelist_type.replace('_', ' ')}", color=0x00FF00)
+
+        for user_id, added_by, added_at, wl_type in whitelist[:10]:  # Limit to 10 users
+            user = await get_user_safely(interaction.client, user_id)
+            adder = await get_user_safely(interaction.client, added_by)
+
+            user_name = user.mention if user else f"unknown user ({user_id})"
+            adder_name = adder.display_name if adder else "unknown"
+
+            embed.add_field(
+                name=user_name,
+                value=f"type: {wl_type.replace('_', ' ')}\nadded by: {adder_name}\nadded: <t:{int(datetime.fromisoformat(added_at).timestamp())}:R>",
+                inline=True
+            )
+
+        if len(whitelist) > 10:
+            embed.set_footer(text=f"showing 10 of {len(whitelist)} whitelisted users")
+
+        footer_text, footer_icon = get_footer_data()
+        if footer_icon:
+            embed.set_footer(text=footer_text, icon_url=footer_icon)
+        else:
+            embed.set_footer(text=footer_text)
+
+
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="back", style=discord.ButtonStyle.secondary)
+    async def back_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Go back to whitelist type selection"""
+        view = AntiNukeWhitelistView(self.guild_id)
+
+        embed = create_embed(
+            title="antinuke whitelist management",
+            description="select whitelist type below",
+            color=0x00FF00
+        )
+
+        embed.add_field(
+            name="whitelist types",
+            value="**all events** - immunity from all antinuke modules\n**channel events** - immunity from channel protection only\n**role events** - immunity from role protection only\n**member events** - immunity from member protection only\n**webhook events** - immunity from webhook protection only\n**guild events** - immunity from guild settings protection only",
+            inline=False
+        )
+
+        embed.add_field(
+            name="current immunity",
+            value="server owner, administrators with role above bot, and whitelisted users",
+            inline=False
+        )
+
+        footer_text, footer_icon = get_footer_data()
+        if footer_icon:
+            embed.set_footer(text=footer_text, icon_url=footer_icon)
+        else:
+            embed.set_footer(text=footer_text)
+
+        await interaction.response.edit_message(embed=embed, view=view)
+
+class AddUserModal(discord.ui.Modal):
+    """Modal for adding users to whitelist"""
+
+    def __init__(self, guild_id: int, whitelist_type: str):
+        super().__init__(title=f"Add User - {whitelist_type.replace('_', ' ')}")
+        self.guild_id = guild_id
+        self.whitelist_type = whitelist_type
+
+    user_input = discord.ui.TextInput(
+        label="User ID or @mention",
+        placeholder="Enter user ID or @mention the user",
+        required=True,
+        max_length=100
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        """Handle user addition"""
+        user_input = self.user_input.value.strip()
+
+        # Extract user ID from mention or direct ID
+        user_id = None
+        if user_input.startswith('<@') and user_input.endswith('>'):
+            user_id = int(user_input[2:-1].replace('!', ''))
+        else:
+            try:
+                user_id = int(user_input)
+            except ValueError:
+                await interaction.response.send_message(
+                    embed=create_error_embed("invalid user ID or mention format"),
+                    ephemeral=True
+                )
+                return
+
+        # Get user object
+        user = await get_user_safely(interaction.client, user_id)
+        if not user:
+            await interaction.response.send_message(
+                embed=create_error_embed("user not found"),
+                ephemeral=True
+            )
+            return
+
+        # Add to whitelist
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            try:
+                await db.execute(
+                    "INSERT INTO antinuke_whitelist (guild_id, user_id, added_by, whitelist_type) VALUES (?, ?, ?, ?)",
+                    (self.guild_id, user_id, interaction.user.id, self.whitelist_type)
+                )
+                await db.commit()
+
+                embed = create_success_embed("user added to whitelist")
+                embed.add_field(name="user", value=user.mention, inline=True)
+                embed.add_field(name="type", value=self.whitelist_type.replace('_', ' '), inline=True)
+
+                footer_text, footer_icon = get_footer_data()
+                if footer_icon:
+                    embed.set_footer(text=footer_text, icon_url=footer_icon)
+                else:
+                    embed.set_footer(text=footer_text)
+
+                await interaction.response.send_message(embed=embed, ephemeral=True)
+
+            except aiosqlite.IntegrityError:
+                await interaction.response.send_message(
+                    embed=create_error_embed("user is already whitelisted"),
+                    ephemeral=True
+                )
+
+class RemoveUserModal(discord.ui.Modal):
+    """Modal for removing users from whitelist"""
+
+    def __init__(self, guild_id: int, whitelist_type: str):
+        super().__init__(title=f"Remove User - {whitelist_type.replace('_', ' ')}")
+        self.guild_id = guild_id
+        self.whitelist_type = whitelist_type
+
+    user_input = discord.ui.TextInput(
+        label="User ID or @mention",
+        placeholder="Enter user ID or @mention the user",
+        required=True,
+        max_length=100
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        """Handle user removal"""
+        user_input = self.user_input.value.strip()
+
+        # Extract user ID from mention or direct ID
+        user_id = None
+        if user_input.startswith('<@') and user_input.endswith('>'):
+            user_id = int(user_input[2:-1].replace('!', ''))
+        else:
+            try:
+                user_id = int(user_input)
+            except ValueError:
+                await interaction.response.send_message(
+                    embed=create_error_embed("invalid user ID or mention format"),
+                    ephemeral=True
+                )
+                return
+
+        # Remove from whitelist
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            cursor = await db.execute(
+                "DELETE FROM antinuke_whitelist WHERE guild_id = ? AND user_id = ? AND whitelist_type = ?",
+                (self.guild_id, user_id, self.whitelist_type)
+            )
+            await db.commit()
+
+            if cursor.rowcount > 0:
+                user = await get_user_safely(interaction.client, user_id)
+                user_name = user.mention if user else f"User ID: {user_id}"
+
+                embed = create_success_embed("user removed from whitelist")
+                embed.add_field(name="user", value=user_name, inline=True)
+                embed.add_field(name="type", value=self.whitelist_type.replace('_', ' '), inline=True)
+
+                footer_text, footer_icon = get_footer_data()
+                if footer_icon:
+                    embed.set_footer(text=footer_text, icon_url=footer_icon)
+                else:
+                    embed.set_footer(text=footer_text)
+
+                await interaction.response.send_message(embed=embed, ephemeral=True)
+            else:
+                await interaction.response.send_message(
+                    embed=create_error_embed("user is not whitelisted for this type"),
+                    ephemeral=True
+                )
+
+class AntiNuke(commands.Cog):
+    """Anti-nuke protection system"""
+
+    def __init__(self, bot):
+        self.bot = bot
+        self.channel_cache = {}  # Cache channel data for restoration
+        self.role_cache = {} # Cache role data for restoration
+        self.guild_cache = {}  # Cache guild data for restoration
+        self.audit_cache = {}  # Cache audit log entries to reduce API calls
+        self.user_action_history = {}  # Track user actions for rate limiting
+        self.processing_queue = {}  # Queue for parallel processing
+        self.rate_limit_tracker = {}  # Track API calls to prevent rate limits
+        self.emergency_lockdown = {} # Track guilds in emergency lockdown
+
+    async def cog_load(self):
+        """Cog loaded successfully"""
+        pass
+
+    async def get_antinuke_settings(self, guild_id: int) -> dict:
+        """Get antinuke settings for guild"""
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            cursor = await db.execute(
+                "SELECT anti_channel_enabled, anti_role_enabled, anti_bot_enabled, anti_member_enabled, anti_guild_enabled, anti_webhook_enabled, auto_recovery, punishment_type, log_channel_id FROM antinuke_settings WHERE guild_id = ?",
+                (guild_id,)
+            )
+            result = await cursor.fetchone()
+
+            if result:
+                return {
+                    'anti_channel_enabled': bool(result[0]),
+                    'anti_role_enabled': bool(result[1]),
+                    'anti_bot_enabled': bool(result[2]),
+                    'anti_member_enabled': bool(result[3]) if len(result) > 3 else False,
+                    'anti_guild_enabled': bool(result[4]) if len(result) > 4 else False,
+                    'anti_webhook_enabled': bool(result[5]) if len(result) > 5 else False,
+                    'auto_recovery': bool(result[6]) if len(result) > 6 else True,
+                    'punishment_type': result[7] or 'kick',
+                    'log_channel_id': result[8]
+                }
+
+            # Create default settings
+            await db.execute(
+                "INSERT OR IGNORE INTO antinuke_settings (guild_id) VALUES (?)",
+                (guild_id,)
+            )
+            await db.commit()
+
+            return {
+                'anti_channel_enabled': False,
+                'anti_role_enabled': False,
+                'anti_bot_enabled': False,
+                'anti_member_enabled': False,
+                'anti_guild_enabled': False,
+                'anti_webhook_enabled': False,
+                'auto_recovery': True,
+                'punishment_type': 'kick',
+                'log_channel_id': None
+            }
+
+    async def is_whitelisted(self, guild_id: int, user_id: int, event_type: str = "all_events") -> bool:
+        """Check if user is whitelisted for specific event type"""
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            cursor = await db.execute(
+                "SELECT id FROM antinuke_whitelist WHERE guild_id = ? AND user_id = ? AND (whitelist_type = ? OR whitelist_type = 'all_events')",
+                (guild_id, user_id, event_type)
+            )
+            return bool(await cursor.fetchone())
+
+    async def is_role_exempted(self, guild_id: int, member: discord.Member, event_type: str = "all_events") -> bool:
+        """Check if user has an exempted role for antinuke"""
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            # Create role exemptions table if it doesn't exist
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS antinuke_role_exemptions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    guild_id INTEGER,
+                    role_id INTEGER,
+                    event_type TEXT DEFAULT 'all_events',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(guild_id, role_id, event_type)
+                )
+            """)
+            await db.commit()
+
+            # Check if user has any exempted roles
+            user_role_ids = [role.id for role in member.roles]
+            if not user_role_ids:
+                return False
+
+            placeholders = ','.join('?' * len(user_role_ids))
+            cursor = await db.execute(f"""
+                SELECT COUNT(*) FROM antinuke_role_exemptions 
+                WHERE guild_id = ? AND role_id IN ({placeholders}) 
+                AND (event_type = ? OR event_type = 'all_events')
+            """, [guild_id] + user_role_ids + [event_type])
+
+            count = (await cursor.fetchone())[0]
+            return count > 0
+
+    async def should_ignore_user(self, guild: discord.Guild, user: discord.User | discord.Member, event_type: str = "all_events") -> bool:
+        """Check if user should be ignored by antinuke"""
+        # Always ignore the bot itself
+        if user.id == self.bot.user.id:
+            return True
+
+        # Check if whitelisted for specific event type or all events
+        if await self.is_whitelisted(guild.id, user.id, event_type) or await self.is_whitelisted(guild.id, user.id, "all_events"):
+            return True
+
+        # Check if user is guild owner
+        if user.id == guild.owner_id:
+            return True
+
+        # Check role-based exemptions
+        member = user if isinstance(user, discord.Member) else guild.get_member(user.id)
+        if member and await self.is_role_exempted(guild.id, member, event_type):
+            return True
+
+        # ANTINUKE PERMISSION REQUIREMENTS:
+        # 1. User must have ADMINISTRATOR permission
+        # 2. User's HIGHEST role must be ABOVE the bot's role in hierarchy
+        # This ensures only trusted administrators with proper role hierarchy can bypass antinuke
+        if member:
+            if member.guild_permissions.administrator:
+                bot_member = guild.get_member(self.bot.user.id)
+                if bot_member and member.top_role > bot_member.top_role:
+                    return True
+
+        return False
+
+    async def track_user_action(self, guild_id: int, user_id: int, action_type: str) -> bool:
+        """Track user actions for rate limiting detection"""
+        import time
+
+        current_time = time.time()
+
+        # Initialize tracking for guild and user
+        if guild_id not in self.user_action_history:
+            self.user_action_history[guild_id] = {}
+        if user_id not in self.user_action_history[guild_id]:
+            self.user_action_history[guild_id][user_id] = []
+
+        # Add current action
+        self.user_action_history[guild_id][user_id].append({
+            'action': action_type,
+            'timestamp': current_time
+        })
+
+        # Clean old entries (older than 60 seconds)
+        self.user_action_history[guild_id][user_id] = [
+            entry for entry in self.user_action_history[guild_id][user_id]
+            if current_time - entry['timestamp'] < 60
+        ]
+
+        # Check for emergency lockdown condition
+        if len(self.user_action_history[guild_id][user_id]) >= 15:  # Example: 15 actions in 60 seconds
+            self.emergency_lockdown[guild_id] = True
+            return True # Indicate lockdown triggered
+
+        return False
+
+
+    async def get_cached_audit_entry(self, guild: discord.Guild, action: discord.AuditLogAction, target_id: int, limit: int = 5):
+        """Get audit log entry with caching to reduce API calls"""
+        import time
+
+        current_time = time.time()
+        cache_key = f"{guild.id}_{action.value}_{target_id}"
+
+        # Check cache first
+        if cache_key in self.audit_cache:
+            cached_entry = self.audit_cache[cache_key]
+            if current_time - cached_entry['timestamp'] < 30:  # Cache for 30 seconds
+                return cached_entry['user']
+
+        # Fetch from audit logs
+        try:
+            async for entry in guild.audit_logs(action=action, limit=limit):
+                if entry.target and entry.target.id == target_id:
+                    # Cache the result
+                    self.audit_cache[cache_key] = {
+                        'user': entry.user,
+                        'timestamp': current_time
+                    }
+                    return entry.user
+        except discord.Forbidden:
+            pass
+
+        return None
+
+    async def log_antinuke_action(self, guild_id: int, user_id: int, action_type: str, target_id: str, target_name: str, punishment: str, reversed: bool = False):
+        """Log antinuke action to database"""
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            await db.execute("""
+                INSERT INTO antinuke_logs (guild_id, user_id, action_type, target_id, target_name, punishment, reversed)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (guild_id, user_id, action_type, target_id, target_name, punishment, reversed))
+            await db.commit()
+
+    async def send_antinuke_log(self, guild: discord.Guild, embed: discord.Embed):
+        """Send antinuke log to configured channel"""
+        settings = await self.get_antinuke_settings(guild.id)
+
+        # Set proper footer with bot info and add timestamp field
+        embed.set_footer(text=f"{self.bot.user.name}#{self.bot.user.discriminator}", icon_url=self.bot.user.avatar.url if self.bot.user.avatar else self.bot.user.default_avatar.url)
+        embed.add_field(name="executed", value=f"<t:{int(datetime.now(timezone.utc).timestamp())}:R>", inline=True)
+
+        # Send to log channel if configured
+        if settings['log_channel_id']:
+            channel = guild.get_channel(settings['log_channel_id'])
+            if channel:
+                try:
+                    await channel.send(embed=embed)
+                    return  # Successfully sent to log channel, don't send DM
+                except discord.Forbidden:
+                    pass
+
+        # Only send DM to guild owner if no log channel is configured
+        try:
+            owner = guild.owner
+            if owner:
+                await owner.send(embed=embed)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+    async def punish_user(self, guild: discord.Guild, user: discord.User | discord.Member, punishment_type: str, reason: str):
+        """Apply punishment to user"""
+        member = guild.get_member(user.id)
+        if not member:
+            return
+
+        # Force kick punishment for bots regardless of configured punishment
+        if member.bot:
+            punishment_type = "kick"
+
+        # Send DM notification before punishment
+        await self.send_punishment_dm(member, punishment_type, reason, guild)
+
+        try:
+            if punishment_type == "strip_roles":
+                # Remove all roles except @everyone
+                roles_to_remove = [role for role in member.roles if role != guild.default_role]
+                if roles_to_remove:
+                    await member.edit(roles=[guild.default_role], reason=reason)
+
+            elif punishment_type == "kick":
+                await member.kick(reason=reason)
+
+            elif punishment_type == "ban":
+                await member.ban(reason=reason, delete_message_days=0)
+
+        except discord.Forbidden:
+            pass
+        except discord.HTTPException:
+            pass
+
+    async def send_punishment_dm(self, member: discord.Member, punishment_type: str, reason: str, guild: discord.Guild, violation_details: str = None):
+        """Send DM notification to user about antinuke action"""
+        try:
+            embed = create_embed(
+                title="anti-nuke action",
+                description=f"you violated an antinuke rule in **{guild.name}**",
+                color=0xFF0000
+            )
+
+            # Extract rule name from reason
+            rule_name = "unknown rule"
+            if "channel" in reason.lower():
+                if "creation" in reason.lower():
+                    rule_name = "channel creation"
+                    violation_details = "created a channel"
+                elif "deletion" in reason.lower():
+                    rule_name = "channel deletion" 
+                    violation_details = "deleted a channel"
+                elif "modification" in reason.lower():
+                    rule_name = "channel modification"
+                    violation_details = "modified a channel"
+            elif "role" in reason.lower():
+                if "creation" in reason.lower():
+                    rule_name = "role creation"
+                    violation_details = "created a role"
+                elif "deletion" in reason.lower():
+                    rule_name = "role deletion"
+                    violation_details = "deleted a role"
+                elif "modification" in reason.lower():
+                    rule_name = "role modification"
+                    violation_details = "modified a role"
+                elif "addition" in reason.lower():
+                    rule_name = "role assignment"
+                    violation_details = "assigned a role to someone"
+                elif "removal" in reason.lower():
+                    rule_name = "role removal"
+                    violation_details = "removed a role from someone"
+            elif "member" in reason.lower():
+                if "kick" in reason.lower():
+                    rule_name = "member kick protection"
+                    violation_details = "kicked a member"
+                elif "ban" in reason.lower():
+                    rule_name = "member ban protection"
+                    violation_details = "banned a member"
+            elif "bot" in reason.lower():
+                rule_name = "bot protection"
+                violation_details = "added an unverified bot"
+            elif "webhook" in reason.lower():
+                if "creation" in reason.lower():
+                    rule_name = "webhook creation"
+                    violation_details = "created a webhook"
+                elif "deletion" in reason.lower():
+                    rule_name = "webhook deletion"
+                    violation_details = "deleted a webhook"
+            elif "guild" in reason.lower() or "emoji" in reason.lower():
+                rule_name = "server settings protection"
+                if "emoji" in reason.lower():
+                    violation_details = "modified server emojis"
+                else:
+                    violation_details = "modified server settings"
+
+            embed.add_field(name="rule violated", value=f"**{rule_name}**", inline=True)
+            embed.add_field(name="your punishment", value=punishment_type, inline=True)
+            embed.add_field(name="what you did", value=violation_details or "unauthorized action", inline=False)
+
+            embed.add_field(
+                name="why this happened",
+                value="this action was taken automatically to protect the server from unauthorized changes",
+                inline=False
+            )
+            embed.add_field(name="executed", value=f"<t:{int(datetime.now(timezone.utc).timestamp())}:R>", inline=True)
+
+            embed.set_footer(text=f"server: {guild.name}")
+
+            await member.send(embed=embed)
+
+        except discord.Forbidden:
+            # User has DMs disabled or blocked the bot
+            pass
+        except discord.HTTPException:
+            # Other error occurred
+            pass
+
+    @commands.hybrid_group(name="antinuke", invoke_without_command=True)
+    async def antinuke(self, ctx):
+        """anti-nuke protection system commands"""
+        if ctx.invoked_subcommand is None:
+            import sys; sys.path.append("."); from utils import create_command_usage_embed
+            prefix = await self.bot.get_guild_prefix(ctx.guild.id) if ctx.guild else "."
+            embed = create_command_usage_embed(
+                self.bot, 
+                "antinuke", 
+                "anti-nuke protection system commands.", 
+                "antinuke", 
+                "antinuke <modules|whitelist|settings|logs>",
+                prefix
+            )
+            footer_text, footer_icon = get_footer_data()
+            if footer_icon:
+                embed.set_footer(text=footer_text, icon_url=footer_icon)
+            else:
+                embed.set_footer(text=footer_text)
+
+            await ctx.send(embed=embed, ephemeral=True)
+
+    @antinuke.command(name="modules")
+    @is_antinuke_admin()
+    async def antinuke_modules(self, ctx):
+        """interactive module management with enable/disable buttons"""
+        # Get current settings to show status
+        settings = await self.get_antinuke_settings(ctx.guild.id)
+
+        view = AntiNukeModuleView(ctx.guild.id)
+
+        embed = create_embed(
+            title="antinuke module configuration",
+            description="select a module below to configure",
+            color=0xFF0000
+        )
+
+        # Show current status
+        channel_status = "ð¢ enabled" if settings['anti_channel_enabled'] else "ð´ disabled"
+        role_status = "ð¢ enabled" if settings['anti_role_enabled'] else "ð´ disabled"
+        bot_status = "ð¢ enabled" if settings['anti_bot_enabled'] else "ð´ disabled"
+        member_status = "ð¢ enabled" if settings['anti_member_enabled'] else "ð´ disabled"
+        webhook_status =  "ð¢ enabled" if settings['anti_webhook_enabled'] else "ð´ disabled"
+        guild_status = "ð¢ enabled" if settings['anti_guild_enabled'] else "ð´ disabled"
+
+
+        embed.add_field(
+            name="current module status",
+            value=f"**anti channel:** {channel_status}\n**anti role:** {role_status}\n**anti bot:** {bot_status}\n**anti member:** {member_status}\n**anti guild:** {guild_status}\n**anti webhook:** {webhook_status}",
+            inline=False
+        )
+
+        embed.add_field(
+            name="available modules",
+            value="â¢ **anti channel** - channel protection system\nâ¢ **anti role** - role protection system\nâ¢ **anti bot** - bot protection system\nâ¢ **anti member** - member kick/ban protection system\nâ¢ **anti guild** - server settings protection system\nâ¢ **anti webhook** - webhook protection system",
+            inline=False
+        )
+
+        embed.add_field(
+            name="features",
+            value="prevents unauthorized channel/role creation\nprevents unauthorized channel/role deletion\nprevents unauthorized channel/role modification\nprevents unauthorized role assignments\nautomatic reversal of actions\nrole recreation with permissions\nrole member restoration\ninstant punishment system",
+            inline=False
+        )
+
+        footer_text, footer_icon = get_footer_data()
+        if footer_icon:
+            embed.set_footer(text=footer_text, icon_url=footer_icon)
+        else:
+            embed.set_footer(text=footer_text)
+
+        await ctx.send(embed=embed, view=view, ephemeral=True)
+
+    @antinuke.command(name="status")
+    @is_antinuke_admin()
+    async def antinuke_status(self, ctx):
+        """show antinuke status"""
+        settings = await self.get_antinuke_settings(ctx.guild.id)
+
+        embed = create_embed(title="antinuke status", color=0xFF0000)
+
+        # Module status
+        status_channel = "ð¢ enabled" if settings['anti_channel_enabled'] else "ð´ disabled"
+        embed.add_field(name="anti channel", value=status_channel, inline=True)
+
+        status_role = "ð¢ enabled" if settings['anti_role_enabled'] else "ð´ disabled"
+        embed.add_field(name="anti role", value=status_role, inline=True)
+
+        status_bot = "ð¢ enabled" if settings['anti_bot_enabled'] else "ð´ disabled"
+        embed.add_field(name="anti bot", value=status_bot, inline=True)
+
+        status_member = "ð¢ enabled" if settings['anti_member_enabled'] else "ð´ disabled"
+        embed.add_field(name="anti member", value=status_member, inline=True)
+
+        status_guild = "ð¢ enabled" if settings['anti_guild_enabled'] else "ð´ disabled"
+        embed.add_field(name="anti guild", value=status_guild, inline=True)
+
+        status_webhook = "ð¢ enabled" if settings['anti_webhook_enabled'] else "ð´ disabled"
+        embed.add_field(name="anti webhook", value=status_webhook, inline=True)
+
+        # Punishment type
+        embed.add_field(name="punishment", value=settings['punishment_type'], inline=True)
+
+        # Log channel
+        log_channel = "not set"
+        if settings['log_channel_id']:
+            channel = ctx.guild.get_channel(settings['log_channel_id'])
+            if channel:
+                log_channel = channel.mention
+        embed.add_field(name="log channel", value=log_channel, inline=True)
+
+        # Whitelist count
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            cursor = await db.execute(
+                "SELECT COUNT(*) FROM antinuke_whitelist WHERE guild_id = ?",
+                (ctx.guild.id,)
+            )
+            whitelist_count = (await cursor.fetchone())[0]
+
+        embed.add_field(name="whitelisted users", value=str(whitelist_count), inline=True)
+
+        footer_text, footer_icon = get_footer_data()
+        if footer_icon:
+            embed.set_footer(text=footer_text, icon_url=footer_icon)
+        else:
+            embed.set_footer(text=footer_text)
+
+
+        await ctx.send(embed=embed, ephemeral=True)
+
+    @antinuke.command(name="punishment")
+    @app_commands.describe(punishment_type="punishment type (strip_roles, kick, ban)")
+    @is_antinuke_admin()
+    async def antinuke_punishment(self, ctx, punishment_type: str):
+        """set antinuke punishment type"""
+        punishment_type = punishment_type.lower()
+
+        if punishment_type not in ["strip_roles", "kick", "ban"]:
+            await ctx.send(embed=create_error_embed("invalid punishment. available: strip_roles, kick, ban"), ephemeral=True)
+            return
+
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            await db.execute(
+                "UPDATE antinuke_settings SET punishment_type = ? WHERE guild_id = ?",
+                (punishment_type, ctx.guild.id)
+            )
+            await db.commit()
+
+        embed = create_success_embed(f"antinuke punishment set to: {punishment_type}")
+        footer_text, footer_icon = get_footer_data()
+        if footer_icon:
+            embed.set_footer(text=footer_text, icon_url=footer_icon)
+        else:
+            embed.set_footer(text=footer_text)
+
+        await ctx.send(embed=embed, ephemeral=True)
+
+    @antinuke.command(name="recovery")
+    @is_antinuke_admin()
+    async def toggle_recovery(self, ctx, enabled: bool = None):
+        """Toggle automatic recovery for antinuke violations"""
+        if enabled is None:
+            settings = await self.get_antinuke_settings(ctx.guild.id)
+            current = settings.get('auto_recovery', True)
+            status = "enabled" if current else "disabled"
+            embed = discord.Embed(
+                title="â¡ auto-recovery status",
+                description=f"automatic recovery is currently **{status}**",
+                color=0x00FF00 if current else 0xFF0000
+            )
+            embed.add_field(
+                name="usage", 
+                value="`.antinuke recovery true` - enable recovery\n`.antinuke recovery false` - disable recovery",
+                inline=False
+            )
+            footer_text, footer_icon = get_footer_data()
+            if footer_icon:
+                embed.set_footer(text=footer_text, icon_url=footer_icon)
+            else:
+                embed.set_footer(text=footer_text)
+
+            return await ctx.send(embed=embed)
+
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            await db.execute(
+                "INSERT OR IGNORE INTO antinuke_settings (guild_id) VALUES (?)",
+                (ctx.guild.id,)
+            )
+            await db.execute(
+                "UPDATE antinuke_settings SET auto_recovery = ? WHERE guild_id = ?",
+                (enabled, ctx.guild.id)
+            )
+            await db.commit()
+
+        status = "enabled" if enabled else "disabled"
+        color = 0x00FF00 if enabled else 0xFF0000
+
+        embed = discord.Embed(
+            title=f"â¡ auto-recovery {status}",
+            description=f"automatic recovery has been **{status}**",
+            color=color,
+            timestamp=discord.utils.utcnow()
+        )
+
+        if enabled:
+            embed.add_field(
+                name="lightning-fast recovery",
+                value="â¢ instantly reverts guild name/setting changes\nâ¢ deletes unauthorized emojis immediately\nâ¢ restores channels and roles\nâ¢ optimized for maximum speed",
+                inline=False
+            )
+        else:
+            embed.add_field(
+                name="punishment only",
+                value="violations will still be detected and punished, but changes won't be automatically reverted",
+                inline=False
+            )
+
+        footer_text, footer_icon = get_footer_data()
+        if footer_icon:
+            embed.set_footer(text=footer_text, icon_url=footer_icon)
+        else:
+            embed.set_footer(text=footer_text)
+
+        await ctx.send(embed=embed)
+
+    @antinuke.group(name="whitelist", invoke_without_command=True)
+    async def antinuke_whitelist(self, ctx):
+        """antinuke whitelist commands"""
+        if ctx.invoked_subcommand is None:
+            import sys; sys.path.append("."); from utils import create_command_usage_embed
+            prefix = await self.bot.get_guild_prefix(ctx.guild.id) if ctx.guild else "."
+            embed = create_command_usage_embed(
+                self.bot, 
+                "antinuke whitelist", 
+                "antinuke whitelist commands.", 
+                "antinuke whitelist", 
+                "antinuke whitelist <manage>",
+                prefix
+            )
+            footer_text, footer_icon = get_footer_data()
+            if footer_icon:
+                embed.set_footer(text=footer_text, icon_url=footer_icon)
+            else:
+                embed.set_footer(text=footer_text)
+
+            await ctx.send(embed=embed, ephemeral=True)
+
+    @antinuke_whitelist.command(name="manage")
+    @is_antinuke_admin()
+    async def whitelist_manage(self, ctx):
+        """interactive whitelist management with event-specific options"""
+        view = AntiNukeWhitelistView(ctx.guild.id)
+
+        embed = create_embed(
+            title="antinuke whitelist management",
+            description="select whitelist type below",
+            color=0x00FF00
+        )
+
+        embed.add_field(
+            name="whitelist types",
+            value="**all events** - immunity from all antinuke modules\n**channel events** - immunity from channel protection only\n**role events** - immunity from role protection only\n**member events** - immunity from member protection only\n**webhook events** - immunity from webhook protection only\n**guild events** - immunity from guild settings protection only",
+            inline=False
+        )
+
+        embed.add_field(
+            name="current immunity",
+            value="server owner, administrators with role above bot, and whitelisted users",
+            inline=False
+        )
+
+        footer_text, footer_icon = get_footer_data()
+        if footer_icon:
+            embed.set_footer(text=footer_text, icon_url=footer_icon)
+        else:
+            embed.set_footer(text=footer_text)
+
+        await ctx.send(embed=embed, view=view, ephemeral=True)
+
+    @antinuke.command(name="logchannel")
+    @app_commands.describe(channel="channel for antinuke logs")
+    @is_antinuke_admin()
+    async def antinuke_logchannel(self, ctx, channel: discord.TextChannel):
+        """set antinuke log channel"""
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            await db.execute(
+                "UPDATE antinuke_settings SET log_channel_id = ? WHERE guild_id = ?",
+                (channel.id, ctx.guild.id)
+            )
+            await db.commit()
+
+        embed = create_success_embed("antinuke log channel set")
+        embed.add_field(name="channel", value=channel.mention, inline=False)
+        embed.add_field(name="note", value="all antinuke actions will be logged here", inline=False)
+
+        footer_text, footer_icon = get_footer_data()
+        if footer_icon:
+            embed.set_footer(text=footer_text, icon_url=footer_icon)
+        else:
+            embed.set_footer(text=footer_text)
+
+        await ctx.send(embed=embed, ephemeral=True)
+
+
+
+    # Event listeners for channel protection
+    @commands.Cog.listener()
+    async def on_guild_channel_create(self, channel):
+        """Handle channel creation"""
+        settings = await self.get_antinuke_settings(channel.guild.id)
+        if not settings['anti_channel_enabled']:
+            return
+
+        # Get the user who created the channel using cached audit logs
+        user = await self.get_cached_audit_entry(channel.guild, discord.AuditLogAction.channel_create, channel.id, 1)
+        if not user:
+            return
+
+        # Track user action for rate limiting
+        if await self.track_user_action(channel.guild.id, user.id, "channel_create"):
+            return  # Emergency lockdown triggered
+
+        # Check if user should be ignored
+        if await self.should_ignore_user(channel.guild, user, "channel_events"):
+            return
+
+        # Determine actual punishment (bots always get kicked)
+        member = channel.guild.get_member(user.id)
+        actual_punishment = "kick" if member and member.bot else settings['punishment_type']
+
+        # Punish user first, then delete channel
+        await self.punish_user(channel.guild, user, settings['punishment_type'], f"antinuke: unauthorized channel creation ({channel.name})")
+        await self.delete_unauthorized_channel(channel)
+
+        # Log the action
+        await self.log_antinuke_action(
+            channel.guild.id, user.id, "channel_create", str(channel.id), channel.name,
+            actual_punishment, True
+        )
+
+        # Send log
+        embed = discord.Embed(
+            title="<:NUKE:1406281515075240020> antinuke violation detected",
+            description="unauthorized channel creation blocked",
+            color=0xFF0000,
+            timestamp=datetime.now(timezone.utc)
+        )
+        embed.add_field(name="violator", value=f"{user.mention}\n`{user}` ({user.id})", inline=True)
+        embed.add_field(name="action", value="created channel", inline=True)
+        embed.add_field(name="target", value=f"`#{channel.name}`", inline=True)
+        embed.add_field(name="channel type", value=str(channel.type).replace('_', ' ').title(), inline=True)
+        embed.add_field(name="â¡ response", value="channel deleted instantly", inline=True)
+        embed.add_field(name="punishment", value=actual_punishment, inline=True)
+
+        await self.send_antinuke_log(channel.guild, embed)
+
+    async def delete_unauthorized_channel(self, channel):
+        """Delete an unauthorized channel"""
+        try:
+            await channel.delete(reason="antinuke: unauthorized channel creation")
+        except discord.Forbidden:
+            pass
+        except Exception as e:
+            print(f"Error deleting unauthorized channel: {e}")
+
+    @commands.Cog.listener()
+    async def on_guild_channel_delete(self, channel):
+        """Handle channel deletion"""
+        settings = await self.get_antinuke_settings(channel.guild.id)
+        if not settings['anti_channel_enabled']:
+            return
+
+        # Cache channel data for restoration
+        self.channel_cache[channel.id] = {
+            'name': channel.name,
+            'type': channel.type,
+            'category': channel.category,
+            'position': channel.position,
+            'overwrites': dict(channel.overwrites),
+            'topic': getattr(channel, 'topic', None),
+            'nsfw': getattr(channel, 'nsfw', False),
+            'slowmode_delay': getattr(channel, 'slowmode_delay', 0)
+        }
+
+        # Get the user who deleted the channel using cached audit logs
+        user = await self.get_cached_audit_entry(channel.guild, discord.AuditLogAction.channel_delete, channel.id)
+        if not user:
+            return
+
+        # Track user action for rate limiting
+        if await self.track_user_action(channel.guild.id, user.id, "channel_delete"):
+            return  # Emergency lockdown triggered
+
+        # Check if user should be ignored
+        if await self.should_ignore_user(channel.guild, user, "channel_events"):
+            return
+
+        # Determine actual punishment (bots always get kicked)
+        member = channel.guild.get_member(user.id)
+        actual_punishment = "kick" if member and member.bot else settings['punishment_type']
+
+        # Punish user first, then recreate channel
+        await self.punish_user(channel.guild, user, settings['punishment_type'], f"antinuke: unauthorized channel deletion ({channel.name})")
+        await self.recreate_channel(channel)
+
+        # Log the action
+        await self.log_antinuke_action(
+            channel.guild.id, user.id, "channel_delete", str(channel.id), channel.name,
+            actual_punishment, True
+        )
+
+        # Send log
+        embed = discord.Embed(
+            title="<:NUKE:1406281515075240020> antinuke violation detected",
+            description="unauthorized channel deletion blocked",
+            color=0xFF0000,
+            timestamp=datetime.now(timezone.utc)
+        )
+        embed.add_field(name="violator", value=f"{user.mention}\n`{user}` ({user.id})", inline=True)
+        embed.add_field(name="action", value="deleted channel", inline=True)
+        embed.add_field(name="target", value=f"`#{channel.name}`", inline=True)
+        embed.add_field(name="channel type", value=str(channel.type).replace('_', ' ').title(), inline=True)
+        embed.add_field(name="â¡ response", value="channel recreated instantly", inline=True)
+        embed.add_field(name="punishment", value=actual_punishment, inline=True)
+
+        await self.send_antinuke_log(channel.guild, embed)
+
+    async def recreate_channel(self, channel):
+        """Recreate a deleted channel"""
+        try:
+            cached_data = self.channel_cache.get(channel.id)
+            if cached_data:
+                if cached_data['type'] == discord.ChannelType.text:
+                    new_channel = await channel.guild.create_text_channel(
+                        name=cached_data['name'],
+                        category=cached_data['category'],
+                        position=cached_data['position'],
+                        topic=cached_data['topic'],
+                        nsfw=cached_data['nsfw'],
+                        slowmode_delay=cached_data['slowmode_delay'],
+                        overwrites=cached_data['overwrites'],
+                        reason="antinuke: restoring deleted channel"
+                    )
+                elif cached_data['type'] == discord.ChannelType.voice:
+                    new_channel = await channel.guild.create_voice_channel(
+                        name=cached_data['name'],
+                        category=cached_data['category'],
+                        position=cached_data['position'],
+                        overwrites=cached_data['overwrites'],
+                        reason="antinuke: restoring deleted channel"
+                    )
+                elif cached_data['type'] == discord.ChannelType.category:
+                     new_channel = await channel.guild.create_category(
+                        name=cached_data['name'],
+                        position=cached_data['position'],
+                        overwrites=cached_data['overwrites'],
+                        reason="antinuke: restoring deleted channel"
+                    )
+
+        except discord.Forbidden:
+            pass
+        except Exception as e:
+            print(f"Error recreating channel: {e}")
+
+    @commands.Cog.listener()
+    async def on_guild_channel_update(self, before, after):
+        """Handle channel updates"""
+        settings = await self.get_antinuke_settings(before.guild.id)
+        if not settings['anti_channel_enabled']:
+            return
+
+        # Get the user who updated the channel from audit logs
+        user = None
+        try:
+            async for entry in before.guild.audit_logs(action=discord.AuditLogAction.channel_update, limit=1):
+                if entry.target.id == before.id:
+                    user = entry.user
+                    break
+        except discord.Forbidden:
+            pass # Bot doesn't have permissions to read audit logs
+
+        if not user:
+            return
+
+        # Check if user should be ignored
+        if await self.should_ignore_user(before.guild, user, "channel_events"):
+            return
+
+        # Revert changes
+        try:
+            # Revert name change
+            if before.name != after.name:
+                await after.edit(name=before.name, reason="antinuke: reverting unauthorized name change")
+
+            # Revert topic change (for text channels)
+            if hasattr(before, 'topic') and hasattr(after, 'topic') and before.topic != after.topic:
+                await after.edit(topic=before.topic, reason="antinuke: reverting unauthorized topic change")
+
+            # Revert permission changes
+            if before.overwrites != after.overwrites:
+                await after.edit(overwrites=before.overwrites, reason="antinuke: reverting unauthorized permission changes")
+
+            # Revert NSFW change (for text channels)
+            if hasattr(before, 'nsfw') and hasattr(after, 'nsfw') and before.nsfw != after.nsfw:
+                await after.edit(nsfw=before.nsfw, reason="antinuke: reverting unauthorized nsfw change")
+
+        except discord.Forbidden:
+            pass
+
+        # Determine what changed
+        changes = []
+        if before.name != after.name:
+            changes.append(f"name: {before.name} â {after.name}")
+        if hasattr(before, 'topic') and hasattr(after, 'topic') and before.topic != after.topic:
+            changes.append("topic changed")
+        if before.overwrites != after.overwrites:
+            changes.append("permissions changed")
+        if hasattr(before, 'nsfw') and hasattr(after, 'nsfw') and before.nsfw != after.nsfw:
+            changes.append("nsfw setting changed")
+
+        if not changes:
+            return
+
+        # Log the action
+        await self.log_antinuke_action(
+            before.guild.id, user.id, "channel_update", str(before.id), before.name,
+            settings['punishment_type'], True
+        )
+
+        # Send log
+        embed = create_embed(title="antinuke action", color=0xFF0000)
+        embed.add_field(name="user", value=user.mention, inline=True)
+        embed.add_field(name="action", value="modified channel", inline=True)
+        embed.add_field(name="channel", value=before.mention, inline=True)
+        embed.add_field(name="changes", value="\n".join(changes), inline=False)
+        response_text = "changes reverted" if settings.get('auto_recovery', True) else "changes logged only"
+        embed.add_field(name="response", value=response_text, inline=False)
+        embed.add_field(name="action taken", value=f"user {settings['punishment_type']}ped", inline=True)
+        embed.add_field(name="executed", value=f"<t:{int(datetime.now(timezone.utc).timestamp())}:R>", inline=True)
+
+        await self.send_antinuke_log(before.guild, embed)
+
+        # Punish user
+        reason = f"antinuke: unauthorized channel modification ({before.name})"
+        await self.punish_user(before.guild, user, settings['punishment_type'], reason)
+
+    @commands.Cog.listener()
+    async def on_guild_role_create(self, role):
+        """Handle role creation"""
+        settings = await self.get_antinuke_settings(role.guild.id)
+        if not settings['anti_role_enabled']:
+            return
+
+        # Get the user who created the role from audit logs
+        user = None
+        try:
+            async for entry in role.guild.audit_logs(action=discord.AuditLogAction.role_create, limit=1):
+                if entry.target.id == role.id:
+                    user = entry.user
+                    break
+        except discord.Forbidden:
+            pass # Bot doesn't have permissions to read audit logs
+
+        if not user:
+            return
+
+        # Check if user should be ignored
+        if await self.should_ignore_user(role.guild, user, "role_events"):
+            return
+
+        # Delete the created role
+        try:
+            await role.delete(reason="antinuke: unauthorized role creation")
+        except discord.Forbidden:
+            pass
+
+        # Determine actual punishment (bots always get kicked)
+        member = role.guild.get_member(user.id)
+        actual_punishment = "kick" if member and member.bot else settings['punishment_type']
+
+        # Log the action
+        await self.log_antinuke_action(
+            role.guild.id, user.id, "role_create", str(role.id), role.name,
+            actual_punishment, True
+        )
+
+        # Punish user first, then delete role
+        reason = f"antinuke: unauthorized role creation ({role.name})"
+        await self.punish_user(role.guild, user, settings['punishment_type'], reason)
+
+        # Send log
+        embed = discord.Embed(
+            title="<:NUKE:1406281515075240020> antinuke violation detected",
+            description="unauthorized role creation blocked",
+            color=0xFF0000,
+            timestamp=datetime.now(timezone.utc)
+        )
+        embed.add_field(name="violator", value=f"{user.mention}\n`{user}` ({user.id})", inline=True)
+        embed.add_field(name="action", value="created role", inline=True)
+        embed.add_field(name="target", value=f"`@{role.name}`", inline=True)
+        embed.add_field(name="permissions", value="administrator" if role.permissions.administrator else "standard", inline=True)
+        embed.add_field(name="â¡ response", value="role deleted instantly", inline=True)
+        embed.add_field(name="punishment", value=actual_punishment, inline=True)
+
+        await self.send_antinuke_log(role.guild, embed)
+
+    @commands.Cog.listener()
+    async def on_guild_role_delete(self, role):
+        """Handle role deletion"""
+        settings = await self.get_antinuke_settings(role.guild.id)
+        if not settings['anti_role_enabled']:
+            return
+
+        # Cache role data for restoration
+        self.role_cache[role.id] = {
+            'name': role.name,
+            'permissions': role.permissions.value,
+            'color': role.color.value,
+            'hoist': role.hoist,
+            'mentionable': role.mentionable,
+            'position': role.position,
+            'members': [member.id for member in role.members]
+        }
+
+        # Get the user who deleted the role from audit logs with retries
+        user = None
+        try:
+            async for entry in role.guild.audit_logs(action=discord.AuditLogAction.role_delete, limit=5):
+                if entry.target and entry.target.id == role.id:
+                    user = entry.user
+                    break
+        except discord.Forbidden:
+            pass # Bot doesn't have permissions to read audit logs
+        except Exception:
+            pass # Other potential errors
+
+        if not user:
+            return
+
+        # Check if user should be ignored
+        if await self.should_ignore_user(role.guild, user, "role_events"):
+            return
+
+        # Recreate the role if auto-recovery is enabled
+        if settings.get('auto_recovery', True):
+            try:
+                cached_data = self.role_cache.get(role.id)
+                if cached_data:
+                    new_role = await role.guild.create_role(
+                        name=cached_data['name'],
+                        permissions=discord.Permissions(cached_data['permissions']),
+                        color=discord.Color(cached_data['color']),
+                        hoist=cached_data['hoist'],
+                        mentionable=cached_data['mentionable'],
+                        reason="antinuke: restoring deleted role"
+                    )
+
+                    # Restore role position (after creation)
+                    try:
+                        await new_role.edit(position=cached_data['position'])
+                    except discord.Forbidden:
+                        pass # Bot might not have permission to set position
+
+                    # Reassign members to the role
+                    for member_id in cached_data['members']:
+                        member = role.guild.get_member(member_id)
+                        if member:
+                            try:
+                                await member.add_roles(new_role, reason="antinuke: restoring role assignment")
+                            except discord.Forbidden:
+                                pass # Bot might not have permission to add role to member
+
+            except discord.Forbidden:
+                pass
+            except Exception as e:
+                print(f"Error recreating role: {e}")
+
+
+        # Determine actual punishment (bots always get kicked)
+        member = role.guild.get_member(user.id)
+        actual_punishment = "kick" if member and member.bot else settings['punishment_type']
+
+        # Log the action
+        await self.log_antinuke_action(
+            role.guild.id, user.id, "role_delete", str(role.id), role.name,
+            actual_punishment, True
+        )
+
+        # Punish user first, then recreate role
+        reason = f"antinuke: unauthorized role deletion ({role.name})"
+        await self.punish_user(role.guild, user, settings['punishment_type'], reason)
+
+        # Send log
+        embed = discord.Embed(
+            title="<:NUKE:1406281515075240020> antinuke violation detected",
+            description="unauthorized role deletion blocked",
+            color=0xFF0000,
+            timestamp=datetime.now(timezone.utc)
+        )
+        embed.add_field(name="violator", value=f"{user.mention}\n`{user}` ({user.id})", inline=True)
+        embed.add_field(name="action", value="deleted role", inline=True)
+        embed.add_field(name="target", value=f"`@{role.name}`", inline=True)
+        embed.add_field(name="members affected", value=str(len(self.role_cache.get(role.id, {}).get('members', []))), inline=True)
+        embed.add_field(name="â¡ response", value="role recreated and members reassigned", inline=True)
+        embed.add_field(name="punishment", value=actual_punishment, inline=True)
+
+        await self.send_antinuke_log(role.guild, embed)
+
+    @commands.Cog.listener()
+    async def on_guild_role_update(self, before, after):
+        """Handle role updates"""
+        settings = await self.get_antinuke_settings(before.guild.id)
+        if not settings['anti_role_enabled']:
+            return
+
+        # Get the user who updated the role from audit logs
+        user = None
+        try:
+            async for entry in before.guild.audit_logs(action=discord.AuditLogAction.role_update, limit=1):
+                if entry.target.id == before.id:
+                    user = entry.user
+                    break
+        except discord.Forbidden:
+            pass # Bot doesn't have permissions to read audit logs
+
+        if not user:
+            return
+
+        # Check if user should be ignored
+        if await self.should_ignore_user(before.guild, user, "role_events"):
+            return
+
+        # Revert changes
+        try:
+            # Revert name change
+            if before.name != after.name:
+                await after.edit(name=before.name, reason="antinuke: reverting unauthorized name change")
+
+            # Revert permission changes
+            if before.permissions != after.permissions:
+                await after.edit(permissions=before.permissions, reason="antinuke: reverting unauthorized permission changes")
+
+             # Revert color changes
+            if before.color != after.color:
+                await after.edit(color=before.color, reason="antinuke: reverting unauthorized color change")
+
+            # Revert hoist changes
+            if before.hoist != after.hoist:
+                await after.edit(hoist=before.hoist, reason="antinuke: reverting unauthorized hoist change")
+
+            # Revert mentionable changes
+            if before.mentionable != after.mentionable:
+                await after.edit(mentionable=before.mentionable, reason="antinuke: reverting unauthorized mentionable change")
+
+        except discord.Forbidden:
+            pass
+
+        # Determine what changed
+        changes = []
+        if before.name != after.name:
+            changes.append(f"name: {before.name} â {after.name}")
+        if before.permissions != after.permissions:
+            changes.append("permissions changed")
+        if before.color != after.color:
+            changes.append("color changed")
+        if before.hoist != after.hoist:
+            changes.append("hoist changed")
+        if before.mentionable != after.mentionable:
+            changes.append("mentionable changed")
+
+        if not changes:
+            return
+
+        # Log the action
+        await self.log_antinuke_action(
+            before.guild.id, user.id, "role_update", str(before.id), before.name,
+            settings['punishment_type'], True
+        )
+
+        # Send log
+        embed = create_embed(title="antinuke action", color=0xFF0000)
+        embed.add_field(name="user", value=user.mention, inline=True)
+        embed.add_field(name="action", value="modified role", inline=True)
+        embed.add_field(name="role", value=before.name, inline=True)
+        embed.add_field(name="changes", value="\n".join(changes), inline=False)
+        response_text = "changes reverted" if settings.get('auto_recovery', True) else "changes logged only"
+        embed.add_field(name="response", value=response_text, inline=False)
+        embed.add_field(name="action taken", value=f"user {settings['punishment_type']}ped", inline=True)
+        embed.add_field(name="executed", value=f"<t:{int(datetime.now(timezone.utc).timestamp())}:R>", inline=True)
+
+        await self.send_antinuke_log(before.guild, embed)
+
+        # Punish user
+        reason = f"antinuke: unauthorized role modification ({before.name})"
+        await self.punish_user(before.guild, user, settings['punishment_type'], reason)
+
+    @commands.Cog.listener()
+    async def on_member_update(self, before, after):
+        """Handle role assignments"""
+        settings = await self.get_antinuke_settings(before.guild.id)
+        if not settings['anti_role_enabled']:
+            return
+
+        # Check if roles were added or removed
+        role_changes = set(before.roles) ^ set(after.roles)
+        if not role_changes:
+            return
+
+        # Determine if role was added or removed
+        added = False
+        removed = False
+        changed_role = None
+        if len(before.roles) < len(after.roles):
+            added = True
+            changed_role = next((role for role in after.roles if role not in before.roles), None)
+        else:
+            removed = True
+            changed_role = next((role for role in before.roles if role not in after.roles), None)
+
+        if not changed_role:
+            return
+
+        # Get the user who changed the roles from audit logs
+        user = None
+        try:
+            async for entry in before.guild.audit_logs(action=discord.AuditLogAction.member_role_update, limit=1):
+                if entry.target.id == before.id:
+                    user = entry.user
+                    break
+        except discord.Forbidden:
+            pass # Bot doesn't have permissions to read audit logs
+
+        if not user:
+            return
+
+        # Check if user should be ignored
+        if await self.should_ignore_user(before.guild, user, "role_events"):
+            return
+
+        # Revert the role change
+        try:
+            if added:
+                await after.remove_roles(changed_role, reason="antinuke: reverting unauthorized role assignment")
+            elif removed:
+                await after.add_roles(changed_role, reason="antinuke: reverting unauthorized role removal")
+        except discord.Forbidden:
+            pass
+
+        # Log the action
+        action_type = "role_add" if added else "role_remove"
+        await self.log_antinuke_action(
+            before.guild.id, user.id, action_type, str(changed_role.id), changed_role.name,
+            settings['punishment_type'], True
+        )
+
+        # Send log
+        embed = create_embed(title="antinuke action", color=0xFF0000)
+        embed.add_field(name="user", value=user.mention, inline=True)
+        embed.add_field(name="target", value=before.mention, inline=True)
+        embed.add_field(name="action", value=f"{'added' if added else 'removed'} role", inline=True)
+        embed.add_field(name="role", value=changed_role.name, inline=True)
+        embed.add_field(name="response", value="change reverted", inline=False)
+        embed.add_field(name="action taken", value=f"user {settings['punishment_type']}ped", inline=True)
+        embed.add_field(name="executed", value=f"<t:{int(datetime.now(timezone.utc).timestamp())}:R>", inline=True)
+
+        await self.send_antinuke_log(before.guild, embed)
+
+        # Punish user
+        reason = f"antinuke: unauthorized role {'addition' if added else 'removal'} ({changed_role.name})"
+        await self.punish_user(before.guild, user, settings['punishment_type'], reason)
+
+    @commands.Cog.listener()
+    async def on_member_join(self, member):
+        """Handle bot joins"""
+        if not member.bot:
+            return
+
+        settings = await self.get_antinuke_settings(member.guild.id)
+        if not settings['anti_bot_enabled']:
+            return
+
+        # Check if bot is verified by Discord
+        if member.public_flags.verified_bot:
+            return
+
+        # Get the user who invited the bot from audit logs
+        inviter = None
+        try:
+            async for entry in member.guild.audit_logs(action=discord.AuditLogAction.bot_add, limit=1):
+                if entry.target.id == member.id:
+                    inviter = entry.user
+                    break
+        except discord.Forbidden:
+            pass # Bot doesn't have permissions to read audit logs
+
+        # Check if inviter should be ignored (if we found one)
+        if inviter and await self.should_ignore_user(member.guild, inviter):
+            return
+
+        # Kick the unverified bot (default for bots is kick)
+        try:
+            await member.kick(reason="antinuke: unverified bot detected")
+        except discord.Forbidden:
+            pass
+
+        # Use kick as default punishment for bot violations, not the configured punishment
+        bot_punishment = "kick"
+
+        # Log the action
+        await self.log_antinuke_action(
+            member.guild.id, inviter.id if inviter else 0, "bot_add", str(member.id), str(member),
+            bot_punishment, True
+        )
+
+        # Send log
+        embed = create_embed(title="antinuke action", color=0xFF0000)
+        embed.add_field(name="action", value="unverified bot added", inline=True)
+        embed.add_field(name="bot", value=f"{member.mention} ({member})", inline=True)
+        if inviter:
+            embed.add_field(name="invited by", value=inviter.mention, inline=True)
+        else:
+            embed.add_field(name="invited by", value="unknown", inline=True)
+        embed.add_field(name="response", value="bot kicked", inline=False)
+        if inviter:
+            embed.add_field(name="action taken", value=f"inviter {bot_punishment}ped", inline=True)
+        embed.add_field(name="note", value="only verified bots are allowed", inline=False)
+        embed.add_field(name="executed", value=f"<t:{int(datetime.now(timezone.utc).timestamp())}:R>", inline=True)
+
+        await self.send_antinuke_log(member.guild, embed)
+
+        # Punish inviter if found (use kick as default for bot violations)
+        if inviter:
+            reason = f"antinuke: invited unverified bot ({member})"
+            await self.punish_user(member.guild, inviter, bot_punishment, reason)
+
+    @commands.Cog.listener()
+    async def on_member_remove(self, member):
+        """Handle member kicks (member leaves without ban)"""
+        settings = await self.get_antinuke_settings(member.guild.id)
+        if not settings['anti_member_enabled']:
+            return
+
+        # Check if member was kicked via audit logs
+        kicker = None
+        try:
+            await asyncio.sleep(1)  # Give audit logs time to update
+            if not member.guild:
+                return
+            async for entry in member.guild.audit_logs(action=discord.AuditLogAction.kick, limit=1):
+                if entry.target.id == member.id:
+                    kicker = entry.user
+                    break
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException, AttributeError):
+            pass # Bot doesn't have permissions or other errors
+
+        if not kicker:
+            return  # Member left voluntarily
+
+        # Check if kicker should be ignored
+        if await self.should_ignore_user(member.guild, kicker, "member_events"):
+            return
+
+        # Track user action for rate limiting
+        if await self.track_user_action(member.guild.id, kicker.id, "member_kick"):
+            return  # Emergency lockdown triggered
+
+        # Send rejoin invite to kicked member
+        await self.send_rejoin_invite(member, kicker)
+
+        # Log the action
+        await self.log_antinuke_action(
+            member.guild.id, kicker.id, "member_kick", str(member.id), str(member),
+            settings['punishment_type'], True
+        )
+
+        # Send log
+        embed = create_embed(title="antinuke action", color=0xFF0000)
+        embed.add_field(name="user", value=kicker.mention, inline=True)
+        embed.add_field(name="action", value="kicked member", inline=True)
+        embed.add_field(name="member", value=f"{member.mention} ({member})", inline=True)
+        embed.add_field(name="response", value="rejoin invite sent to member", inline=False)
+        embed.add_field(name="action taken", value=f"kicker {settings['punishment_type']}ped", inline=True)
+
+        # Add emergency status if in lockdown
+        if member.guild.id in self.emergency_lockdown:
+            embed.add_field(name="â ï¸ emergency mode", value="enhanced protection active", inline=False)
+
+        embed.add_field(name="executed", value=f"<t:{int(datetime.now(timezone.utc).timestamp())}:R>", inline=True)
+
+        await self.send_antinuke_log(member.guild, embed)
+
+        # Punish kicker
+        reason = f"antinuke: unauthorized member kick ({member})"
+        await self.punish_user(member.guild, kicker, settings['punishment_type'], reason)
+
+    @commands.Cog.listener()
+    async def on_member_ban(self, guild, user):
+        """Handle member bans"""
+        settings = await self.get_antinuke_settings(guild.id)
+        if not settings['anti_member_enabled']:
+            return
+
+        # Get the user who banned the member from audit logs
+        banner = None
+        try:
+            await asyncio.sleep(1)  # Give audit logs time to update
+            async for entry in guild.audit_logs(action=discord.AuditLogAction.ban, limit=1):
+                if entry.target.id == user.id:
+                    banner = entry.user
+                    break
+        except discord.Forbidden:
+            pass # Bot doesn't have permissions
+
+        if not banner:
+            return
+
+        # Check if banner should be ignored
+        if await self.should_ignore_user(guild, banner, "member_events"):
+            return
+
+        # Track user action for rate limiting
+        if await self.track_user_action(guild.id, banner.id, "member_ban"):
+            return  # Emergency lockdown triggered
+
+        # Unban the member
+        try:
+            await guild.unban(user, reason="antinuke: reverting unauthorized ban")
+        except discord.Forbidden:
+            pass
+        except discord.NotFound:
+            pass  # User wasn't actually banned
+
+        # Send unban notification to user
+        await self.send_unban_notification(user, banner, guild)
+
+        # Log the action
+        await self.log_antinuke_action(
+            guild.id, banner.id, "member_ban", str(user.id), str(user),
+            settings['punishment_type'], True
+        )
+
+        # Send log
+        embed = create_embed(title="antinuke action", color=0xFF0000)
+        embed.add_field(name="user", value=banner.mention, inline=True)
+        embed.add_field(name="action", value="banned member", inline=True)
+        embed.add_field(name="member", value=f"{user.mention} ({user})", inline=True)
+        embed.add_field(name="response", value="member unbanned", inline=False)
+        embed.add_field(name="action taken", value=f"banner {settings['punishment_type']}ped", inline=True)
+
+        # Add emergency status if in lockdown
+        if guild.id in self.emergency_lockdown:
+            embed.add_field(name="â ï¸ emergency mode", value="enhanced protection active", inline=False)
+
+        embed.add_field(name="executed", value=f"<t:{int(datetime.now(timezone.utc).timestamp())}:R>", inline=True)
+
+        await self.send_antinuke_log(guild, embed)
+
+        # Punish banner
+        reason = f"antinuke: unauthorized member ban ({user})"
+        await self.punish_user(guild, banner, settings['punishment_type'], reason)
+
+    async def send_rejoin_invite(self, member, kicker):
+        """Send rejoin invite to kicked member"""
+        try:
+            # Create an invite to the guild
+            invite = None
+            for channel in member.guild.text_channels:
+                try:
+                    invite = await channel.create_invite(
+                        max_age=86400,  # 24 hours
+                        max_uses=1,
+                        unique=True,
+                        reason="antinuke: rejoin invite for unauthorized kick"
+                    )
+                    break
+                except discord.Forbidden:
+                    continue
+
+            if not invite:
+                return  # Couldn't create invite
+
+            embed = create_embed(
+                title="antinuke protection",
+                description=f"you were kicked from **{member.guild.name}** without authorization",
+                color=0x00FF00
+            )
+
+            embed.add_field(name="kicked by", value=str(kicker), inline=True)
+            embed.add_field(name="action taken", value=f"{kicker} has been punished", inline=True)
+            embed.add_field(name="rejoin link", value=f"[click here to rejoin]({invite.url})", inline=False)
+            embed.add_field(
+                name="note", 
+                value="this invite is valid for 24 hours and can only be used once", 
+                inline=False
+            )
+            embed.add_field(name="executed", value=f"<t:{int(datetime.now(timezone.utc).timestamp())}:R>", inline=True)
+
+            embed.set_footer(text=f"server: {member.guild.name}")
+
+            await member.send(embed=embed)
+
+        except discord.Forbidden:
+            # User has DMs disabled
+            pass
+        except Exception:
+            # Other error occurred
+            pass
+
+    async def send_unban_notification(self, user, banner, guild):
+        """Send unban notification to user"""
+        try:
+            embed = create_embed(
+                title="antinuke protection",
+                description=f"you were banned from **{guild.name}** without authorization",
+                color=0x00FF00
+            )
+
+            embed.add_field(name="banned by", value=str(banner), inline=True)
+            embed.add_field(name="action taken", value=f"{banner} has been punished", inline=True)
+            embed.add_field(name="status", value="you have been automatically unbanned", inline=False)
+            embed.add_field(
+                name="note", 
+                value="you can now rejoin the server if you have an invite", 
+                inline=False
+            )
+            embed.add_field(name="executed", value=f"<t:{int(datetime.now(timezone.utc).timestamp())}:R>", inline=True)
+
+            embed.set_footer(text=f"server: {guild.name}")
+
+            await user.send(embed=embed)
+
+        except discord.Forbidden:
+            # User has DMs disabled
+            pass
+        except Exception:
+            # Other error occurred
+            pass
+
+    @commands.Cog.listener()
+    async def on_guild_update(self, before, after):
+        """Monitor guild settings changes with lightning-fast response"""
+        if not after or not hasattr(after, 'id'):
+            return
+
+        # Lightning fast settings check with caching
+        settings = await self.get_antinuke_settings_cached(after.id)
+        if not settings.get('anti_guild_enabled'):
+            return
+
+        # Cache guild state for recovery
+        self.guild_cache[after.id] = {
+            'name': before.name,
+            'description': before.description,
+            'icon': before.icon,
+            'banner': before.banner,
+            'verification_level': before.verification_level,
+            'default_notifications': before.default_notifications,
+            'explicit_content_filter': before.explicit_content_filter,
+            'premium_progress_bar_enabled': before.premium_progress_bar_enabled
+        }
+
+        # Ultra-fast audit log check with rate limit protection
+        audit_user = await self.get_audit_user_fast(after, discord.AuditLogAction.guild_update)
+        if not audit_user or await self.should_ignore_user(after, audit_user, "guild_events"):
+            return
+
+        # Detect changes instantly
+        changes = []
+        recovery_needed = False
+
+        if before.name != after.name:
+            changes.append(f"name: '{before.name}' â '{after.name}'")
+            recovery_needed = True
+        if before.description != after.description:
+            changes.append("description changed")
+            recovery_needed = True
+        if before.icon != after.icon:
+            changes.append("icon changed")
+            recovery_needed = True
+        if before.banner != after.banner:
+            changes.append("banner changed")
+            recovery_needed = True
+        if before.verification_level != after.verification_level:
+            changes.append(f"verification: {before.verification_level} â {after.verification_level}")
+            recovery_needed = True
+        if before.default_notifications != after.default_notifications:
+            changes.append(f"notifications: {before.default_notifications} â {after.default_notifications}")
+            recovery_needed = True
+        if before.explicit_content_filter != after.explicit_content_filter:
+            changes.append(f"content filter: {before.explicit_content_filter} â {after.explicit_content_filter}")
+            recovery_needed = True
+        if before.premium_progress_bar_enabled != after.premium_progress_bar_enabled:
+            changes.append("progress bar setting changed")
+            recovery_needed = True
+
+        if changes and recovery_needed:
+            await self.handle_guild_violation_with_recovery(before, after, audit_user, "guild_update", f"unauthorized guild changes: {', '.join(changes)}", settings)
+
+    @commands.Cog.listener() 
+    async def on_guild_emojis_update(self, guild, before, after):
+        """Monitor emoji changes with lightning-fast response"""
+        settings = await self.get_antinuke_settings_cached(guild.id)
+        if not settings.get('anti_guild_enabled'):
+            return
+
+        # Ultra-fast emoji change detection
+        new_emojis = [e for e in after if e not in before]
+        deleted_emojis = [e for e in before if e not in after]
+
+        if not new_emojis and not deleted_emojis:
+            return
+
+        # Lightning-fast audit user detection
+        if new_emojis:
+            audit_user = await self.get_audit_user_fast(guild, discord.AuditLogAction.emoji_create)
+            if audit_user and not await self.should_ignore_user(guild, audit_user, "guild_events"):
+                # Instant emoji deletion with recovery
+                delete_tasks = []
+                if settings.get('auto_recovery', True):
+                    for emoji in new_emojis:
+                        delete_tasks.append(self.safe_emoji_delete(emoji, "antinuke: unauthorized emoji creation"))
+
+                emoji_names = [e.name for e in new_emojis]
+
+                # Execute deletion and punishment in parallel
+                punishment_task = self.punish_user_fast(guild, audit_user, settings.get('punishment_type', 'ban'), 
+                                                     f"antinuke: emoji_create - unauthorized emoji creation: {', '.join(emoji_names)}")
+
+                all_tasks = delete_tasks + [punishment_task]
+                await asyncio.gather(*all_tasks, return_exceptions=True)
+
+                # Async logging
+                asyncio.create_task(self.log_guild_violation_async(guild.id, audit_user.id, "emoji_create", 
+                                                                f"unauthorized emoji creation: {', '.join(emoji_names)}", 
+                                                                settings.get('punishment_type', 'ban'), 
+                                                                settings.get('auto_recovery', True)))
+
+        if deleted_emojis:
+            audit_user = await self.get_audit_user_fast(guild, discord.AuditLogAction.emoji_delete)
+            if audit_user and not await self.should_ignore_user(guild, audit_user, "guild_events"):
+                emoji_names = [e.name for e in deleted_emojis]
+
+                # Note: Cannot recover deleted emojis, only punish
+                await self.punish_user_fast(guild, audit_user, settings.get('punishment_type', 'ban'),
+                                          f"antinuke: emoji_delete - unauthorized emoji deletion: {', '.join(emoji_names)}")
+
+                asyncio.create_task(self.log_guild_violation_async(guild.id, audit_user.id, "emoji_delete",
+                                                                f"unauthorized emoji deletion: {', '.join(emoji_names)}", 
+                                                                settings.get('punishment_type', 'ban'), False))
+
+    async def safe_emoji_delete(self, emoji, reason):
+        """Safely delete emoji with error handling"""
+        try:
+            await emoji.delete(reason=reason)
+        except Exception:
+            pass
+
+    async def punish_user_fast(self, guild, user, punishment_type, reason):
+        """Lightning-fast user punishment"""
+        try:
+            if punishment_type == 'ban':
+                await guild.ban(user, reason=reason, delete_message_days=0)
+            elif punishment_type == 'kick':
+                await guild.kick(user, reason=reason)
+            elif punishment_type == 'timeout':
+                if hasattr(user, 'timeout'):
+                    from datetime import timedelta
+                    await user.timeout(timedelta(hours=1), reason=reason)
+        except Exception:
+            pass
+
+    @commands.Cog.listener()
+    async def on_guild_stickers_update(self, guild, before, after):
+        """Monitor sticker changes"""
+        settings = await self.get_antinuke_settings(guild.id)
+        if not settings.get('anti_guild_enabled'):
+            return
+
+        # Find who made the change
+        audit_user = None
+        try:
+            audit_logs = guild.audit_logs(action=discord.AuditLogAction.sticker_create, limit=1)
+            entry = await audit_logs.flatten()
+            if entry:
+                audit_user = entry[0].user
+        except:
+            try:
+                audit_logs = guild.audit_logs(action=discord.AuditLogAction.sticker_delete, limit=1)
+                entry = await audit_logs.flatten()
+                if entry:
+                    audit_user = entry[0].user
+            except:
+                return
+
+        if await self.should_ignore_user(guild, audit_user, "guild_events"):
+            return
+
+        # Check for sticker changes
+        if len(after) > len(before):
+            # Sticker added
+            new_stickers = [s for s in after if s not in before]
+            sticker_names = [s.name for s in new_stickers]
+            await self.handle_guild_violation(guild, audit_user, "sticker_create", f"antinuke: unauthorized sticker creation: {', '.join(sticker_names)}")
+        elif len(before) > len(after):
+            # Sticker deleted
+            deleted_stickers = [s for s in before if s not in after]
+            sticker_names = [s.name for s in deleted_stickers]
+            await self.handle_guild_violation(guild, audit_user, "sticker_delete", f"antinuke: unauthorized sticker deletion: {', '.join(sticker_names)}")
+
+    @commands.Cog.listener()
+    async def on_automod_rule_create(self, rule):
+        """Monitor automod rule creation"""
+        settings = await self.get_antinuke_settings(rule.guild.id)
+        if not settings.get('anti_guild_enabled'):
+            return
+
+        # Find who created the automod rule
+        audit_user = None
+        try:
+            audit_logs = rule.guild.audit_logs(action=discord.AuditLogAction.automod_rule_create, limit=1)
+            entry = await audit_logs.flatten()
+            if entry:
+                audit_user = entry[0].user
+        except:
+            return
+
+        if await self.should_ignore_user(rule.guild, audit_user, "guild_events"):
+            return
+
+        await self.handle_guild_violation(rule.guild, audit_user, "automod_rule_create", f"antinuke: unauthorized automod rule creation: {rule.name}")
+
+    @commands.Cog.listener()
+    async def on_automod_rule_update(self, rule):
+        """Monitor automod rule updates"""
+        settings = await self.get_antinuke_settings(rule.guild.id)
+        if not settings.get('anti_guild_enabled'):
+            return
+
+        # Find who updated the automod rule
+        audit_user = None
+        try:
+            audit_logs = rule.guild.audit_logs(action=discord.AuditLogAction.automod_rule_update, limit=1)
+            entry = await audit_logs.flatten()
+            if entry:
+                audit_user = entry[0].user
+        except:
+            return
+
+        if await self.should_ignore_user(rule.guild, audit_user, "guild_events"):
+            return
+
+        await self.handle_guild_violation(rule.guild, audit_user, "automod_rule_update", f"antinuke: unauthorized automod rule modification: {rule.name}")
+
+    @commands.Cog.listener()
+    async def on_automod_rule_delete(self, rule):
+        """Monitor automod rule deletion"""
+        settings = await self.get_antinuke_settings(rule.guild.id)
+        if not settings.get('anti_guild_enabled'):
+            return
+
+        # Find who deleted the automod rule
+        audit_user = None
+        try:
+            audit_logs = rule.guild.audit_logs(action=discord.AuditLogAction.automod_rule_delete, limit=1)
+            entry = await audit_logs.flatten()
+            if entry:
+                audit_user = entry[0].user
+        except:
+            return
+
+        if await self.should_ignore_user(rule.guild, audit_user, "guild_events"):
+            return
+
+        await self.handle_guild_violation(rule.guild, audit_user, "automod_rule_delete", f"antinuke: unauthorized automod rule deletion: {rule.name}")
+
+    @commands.Cog.listener()
+    async def on_integration_create(self, integration):
+        """Monitor integration additions (bots, webhooks, etc.)"""
+        settings = await self.get_antinuke_settings(integration.guild.id)
+        if not settings.get('anti_guild_enabled'):
+            return
+
+        # Get who created the integration
+        audit_user = await self.get_audit_user_fast(integration.guild, discord.AuditLogAction.integration_create)
+        if not audit_user or await self.should_ignore_user(integration.guild, audit_user, "guild_events"):
+            return
+
+        # Log and punish unauthorized integration
+        await self.handle_guild_violation_fast(integration.guild, audit_user, "integration_create", 
+                                             f"unauthorized integration creation: {integration.name}", settings)
+
+    @commands.Cog.listener()
+    async def on_integration_delete(self, integration):
+        """Monitor integration deletions"""
+        settings = await self.get_antinuke_settings(integration.guild.id)
+        if not settings.get('anti_guild_enabled'):
+            return
+
+        # Get who deleted the integration
+        audit_user = await self.get_audit_user_fast(integration.guild, discord.AuditLogAction.integration_delete)
+        if not audit_user or await self.should_ignore_user(integration.guild, audit_user, "guild_events"):
+            return
+
+        await self.handle_guild_violation_fast(integration.guild, audit_user, "integration_delete",
+                                             f"unauthorized integration deletion: {integration.name}", settings)
+
+    @commands.Cog.listener()
+    async def on_invite_create(self, invite):
+        """Monitor invite creation for mass invite spam protection"""
+        settings = await self.get_antinuke_settings(invite.guild.id)
+        if not settings.get('anti_guild_enabled'):
+            return
+
+        # Track invite creation rate
+        if await self.track_user_action(invite.guild.id, invite.inviter.id if invite.inviter else 0, "invite_create"):
+            return  # Emergency lockdown triggered
+
+        # Get who created the invite
+        if invite.inviter and not await self.should_ignore_user(invite.guild, invite.inviter, "guild_events"):
+            # Check if user is creating too many invites
+            recent_invites = len([a for a in self.user_action_history.get(invite.guild.id, {}).get(invite.inviter.id, []) 
+                                if a['action'] == 'invite_create'])
+
+            if recent_invites >= 5:  # 5+ invites in 60 seconds
+                await self.handle_guild_violation_fast(invite.guild, invite.inviter, "mass_invite_create",
+                                                     f"mass invite creation detected", settings)
+
+    @commands.Cog.listener()
+    async def on_guild_scheduled_event_create(self, event):
+        """Monitor scheduled event creation"""
+        settings = await self.get_antinuke_settings(event.guild.id)
+        if not settings.get('anti_guild_enabled'):
+            return
+
+        # Get who created the event
+        audit_user = await self.get_audit_user_fast(event.guild, discord.AuditLogAction.scheduled_event_create)
+        if not audit_user or await self.should_ignore_user(event.guild, audit_user, "guild_events"):
+            return
+
+        await self.handle_guild_violation_fast(event.guild, audit_user, "scheduled_event_create",
+                                             f"unauthorized scheduled event creation: {event.name}", settings)
+
+    @commands.Cog.listener()
+    async def on_guild_scheduled_event_delete(self, event):
+        """Monitor scheduled event deletion"""
+        settings = await self.get_antinuke_settings(event.guild.id)
+        if not settings.get('anti_guild_enabled'):
+            return
+
+        # Get who deleted the event
+        audit_user = await self.get_audit_user_fast(event.guild, discord.AuditLogAction.scheduled_event_delete)
+        if not audit_user or await self.should_ignore_user(event.guild, audit_user, "guild_events"):
+            return
+
+        await self.handle_guild_violation_fast(event.guild, audit_user, "scheduled_event_delete",
+                                             f"unauthorized scheduled event deletion: {event.name}", settings)
+
+    async def get_antinuke_settings_cached(self, guild_id: int) -> dict:
+        """Lightning-fast cached settings retrieval"""
+        cache_key = f"settings_{guild_id}"
+        current_time = asyncio.get_event_loop().time()
+
+        # Check cache (5 second expiry for ultra-fast response)
+        if cache_key in self.audit_cache:
+            cached_time, cached_data = self.audit_cache[cache_key]
+            if current_time - cached_time < 5:
+                return cached_data
+
+        # Fetch fresh data
+        settings = await self.get_antinuke_settings(guild_id)
+        self.audit_cache[cache_key] = (current_time, settings)
+        return settings
+
+    async def get_audit_user_fast(self, guild, action_type):
+        """Ultra-fast audit log retrieval with rate limit protection"""
+        guild_id = guild.id
+        current_time = asyncio.get_event_loop().time()
+
+        # Rate limit protection - max 5 audit log calls per second per guild
+        rate_key = f"audit_{guild_id}"
+        if rate_key not in self.rate_limit_tracker:
+            self.rate_limit_tracker[rate_key] = []
+
+        # Clean old entries
+        self.rate_limit_tracker[rate_key] = [t for t in self.rate_limit_tracker[rate_key] if current_time - t < 1]
+
+        # Check rate limit
+        if len(self.rate_limit_tracker[rate_key]) >= 5:
+            return None  # Skip audit log check to prevent rate limit
+
+        try:
+            self.rate_limit_tracker[rate_key].append(current_time)
+            async for entry in guild.audit_logs(action=action_type, limit=1):
+                return entry.user
+        except Exception:
+            pass
+        return None
+
+    async def handle_guild_violation_fast(self, guild, user, action_type, details, settings):
+        """Handle guild violations without recovery (for events that can't be reverted)"""
+        if not user:
+            return
+
+        punishment = settings.get('punishment_type', 'ban')
+
+        # Apply punishment
+        try:
+            if punishment == 'ban':
+                await guild.ban(user, reason=f"antinuke: {action_type} - {details}", delete_message_days=0)
+            elif punishment == 'kick':
+                await guild.kick(user, reason=f"antinuke: {action_type} - {details}")
+            elif punishment == 'timeout':
+                if hasattr(user, 'timeout'):
+                    from datetime import timedelta
+                    await user.timeout(timedelta(hours=1), reason=f"antinuke: {action_type} - {details}")
+        except Exception:
+            pass
+
+        # Log the violation (non-blocking)
+        asyncio.create_task(self.log_guild_violation_async(guild.id, user.id, action_type, details, punishment, False))
+
+    async def handle_guild_violation_with_recovery(self, before_guild, after_guild, user, action_type, details, settings):
+        """Handle guild violations with lightning-fast recovery"""
+        if not user:
+            return
+
+        guild = after_guild
+        punishment = settings.get('punishment_type', 'ban')
+        auto_recovery = settings.get('auto_recovery', True)
+
+        # LIGHTNING FAST RECOVERY - Revert changes immediately
+        if auto_recovery and before_guild.id in self.guild_cache:
+            cached_state = self.guild_cache[before_guild.id]
+            recovery_tasks = []
+
+            try:
+                # Build recovery operations
+                edit_kwargs = {}
+
+                if before_guild.name != after_guild.name and cached_state.get('name'):
+                    edit_kwargs['name'] = cached_state['name']
+
+                if before_guild.verification_level != after_guild.verification_level and cached_state.get('verification_level') is not None:
+                    edit_kwargs['verification_level'] = cached_state['verification_level']
+
+                if before_guild.default_notifications != after_guild.default_notifications and cached_state.get('default_notifications') is not None:
+                    edit_kwargs['default_notifications'] = cached_state['default_notifications']
+
+                if before_guild.explicit_content_filter != after_guild.explicit_content_filter and cached_state.get('explicit_content_filter') is not None:
+                    edit_kwargs['explicit_content_filter'] = cached_state['explicit_content_filter']
+
+                if before_guild.premium_progress_bar_enabled != after_guild.premium_progress_bar_enabled and cached_state.get('premium_progress_bar_enabled') is not None:
+                    edit_kwargs['premium_progress_bar_enabled'] = cached_state['premium_progress_bar_enabled']
+
+
+                # Execute recovery instantly
+                if edit_kwargs:
+                    recovery_tasks.append(
+                        guild.edit(**edit_kwargs, reason="antinuke: reverting unauthorized guild changes")
+                    )
+
+            except Exception:
+                pass
+
+        # Parallel execution of punishment and logging
+        punishment_tasks = []
+
+        # Apply punishment
+        try:
+            if punishment == 'ban':
+                punishment_tasks.append(guild.ban(user, reason=f"antinuke: {action_type} - {details}", delete_message_days=0))
+            elif punishment == 'kick':
+                punishment_tasks.append(guild.kick(user, reason=f"antinuke: {action_type} - {details}"))
+            elif punishment == 'timeout':
+                if hasattr(user, 'timeout'):
+                    from datetime import timedelta
+                    punishment_tasks.append(user.timeout(timedelta(hours=1), reason=f"antinuke: {action_type} - {details}"))
+        except Exception:
+            pass
+
+        # Execute all operations in parallel for maximum speed
+        all_tasks = recovery_tasks + punishment_tasks
+        if all_tasks:
+            await asyncio.gather(*all_tasks, return_exceptions=True)
+
+        # Log the violation (non-blocking)
+        asyncio.create_task(self.log_guild_violation_async(guild.id, user.id, action_type, details, punishment, auto_recovery))
+
+    async def log_guild_violation_async(self, guild_id, user_id, action_type, details, punishment, recovery_enabled):
+        """Async logging to prevent blocking main thread"""
+        try:
+            # Log to database
+            await self.log_antinuke_action(guild_id, user_id, action_type, str(guild_id), "guild_settings", punishment)
+
+            # Send log to channel
+            guild = self.bot.get_guild(guild_id)
+            if not guild:
+                return
+
+            settings = await self.get_antinuke_settings_cached(guild_id)
+            log_channel_id = settings.get('log_channel_id')
+
+            if log_channel_id:
+                log_channel = guild.get_channel(log_channel_id)
+                if log_channel:
+                    embed = discord.Embed(
+                        title="<:NUKE:1406281515075240020> anti-guild violation detected",
+                        description=f"**Action:** {action_type}\n**Details:** {details}\n**User:** <@{user_id}> ({user_id})\n**Punishment:** {punishment}\n**Recovery:** {'â enabled' if recovery_enabled else 'â disabled'}",
+                        color=0xFF0000,
+                        timestamp=discord.utils.utcnow()
+                    )
+                    footer_text, footer_icon = get_footer_data()
+                    if footer_icon:
+                        embed.set_footer(text=footer_text, icon_url=footer_icon)
+                    else:
+                        embed.set_footer(text=footer_text)
+
+                    await log_channel.send(embed=embed)
+        except Exception:
+            pass
+
+    @commands.Cog.listener()
+    async def on_webhook_create(self, webhook):
+        """Handle webhook creation."""
+        settings = await self.get_antinuke_settings(webhook.guild_id)
+        if not settings['anti_webhook_enabled']:
+            return
+
+        # Get the user who created the webhook using cached audit logs
+        user = await self.get_cached_audit_entry(webhook.guild, discord.AuditLogAction.webhook_create, webhook.id, 1)
+        if not user:
+            return
+
+        # Track user action for rate limiting
+        if await self.track_user_action(webhook.guild.id, user.id, "webhook_create"):
+            return  # Emergency lockdown triggered
+
+        # Check if user should be ignored
+        if await self.should_ignore_user(webhook.guild, user, "webhook_events"):
+            return
+
+        # Determine actual punishment (bots always get kicked)
+        member = webhook.guild.get_member(user.id)
+        actual_punishment = "kick" if member and member.bot else settings['punishment_type']
+
+        # Punish user first, then delete webhook
+        await self.punish_user(webhook.guild, user, settings['punishment_type'], f"antinuke: unauthorized webhook creation ({webhook.name})")
+        await self.delete_unauthorized_webhook(webhook)
+
+        # Log the action
+        await self.log_antinuke_action(
+            webhook.guild.id, user.id, "webhook_create", str(webhook.id), webhook.name,
+            actual_punishment, True
+        )
+
+        # Send log
+        embed = discord.Embed(
+            title="<:NUKE:1406281515075240020> antinuke violation detected",
+            description="unauthorized webhook creation blocked",
+            color=0xFF0000,
+            timestamp=datetime.now(timezone.utc)
+        )
+        embed.add_field(name="violator", value=f"{user.mention}\n`{user}` ({user.id})", inline=True)
+        embed.add_field(name="action", value="created webhook", inline=True)
+        embed.add_field(name="target", value=f"`{webhook.name}`", inline=True)
+        embed.add_field(name="â¡ response", value="webhook deleted instantly", inline=True)
+        embed.add_field(name="punishment", value=actual_punishment, inline=True)
+
+        await self.send_antinuke_log(webhook.guild, embed)
+
+    async def delete_unauthorized_webhook(self, webhook):
+        """Delete an unauthorized webhook"""
+        try:
+            await webhook.delete(reason="antinuke: unauthorized webhook creation")
+        except discord.Forbidden:
+            pass
+        except Exception as e:
+            print(f"Error deleting unauthorized webhook: {e}")
+
+    @commands.Cog.listener()
+    async def on_webhook_delete(self, webhook):
+        """Handle webhook deletion."""
+        settings = await self.get_antinuke_settings(webhook.guild.id)
+        if not settings['anti_webhook_enabled']:
+            return
+
+        # Get the user who deleted the webhook using cached audit logs
+        user = await self.get_cached_audit_entry(webhook.guild, discord.AuditLogAction.webhook_delete, webhook.id, 1)
+        if not user:
+            return
+
+        # Track user action for rate limiting
+        if await self.track_user_action(webhook.guild.id, user.id, "webhook_delete"):
+            return  # Emergency lockdown triggered
+
+        # Check if user should be ignored
+        if await self.should_ignore_user(webhook.guild, user, "webhook_events"):
+            return
+
+        # Log the action (no webhook recreation, per request)
+        await self.log_antinuke_action(
+            webhook.guild.id, user.id, "webhook_delete", str(webhook.id), webhook.name,
+            settings['punishment_type'], False  # Not reversed, just logged
+        )
+
+        # Send log
+        embed = create_embed(title="antinuke action", color=0xFF0000)
+        embed.add_field(name="user", value=user.mention, inline=True)
+        embed.add_field(name="action", value="deleted webhook", inline=True)
+        embed.add_field(name="webhook", value=webhook.name, inline=True)
+        embed.add_field(name="response", value="webhook deletion logged", inline=False)  # No recreation
+        embed.add_field(name="action taken", value=f"user {settings['punishment_type']}ped", inline=True)
+
+        # Add emergency status if in lockdown
+        if webhook.guild.id in self.emergency_lockdown:
+            embed.add_field(name="â ï¸ emergency mode", value="enhanced protection active", inline=False)
+
+        embed.add_field(name="executed", value=f"<t:{int(datetime.now(timezone.utc).timestamp())}:R>", inline=True)
+
+        await self.send_antinuke_log(webhook.guild, embed)
+
+        # Punish user
+        punish_task = asyncio.create_task(self.punish_user(webhook.guild, user, settings['punishment_type'], f"antinuke: unauthorized webhook deletion ({webhook.name})"))
+        await punish_task
+
+async def setup(bot):
+    await bot.add_cog(AntiNuke(bot))
