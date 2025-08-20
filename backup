@@ -1,0 +1,1701 @@
+import discord
+from discord.ext import commands
+from discord import app_commands
+from utils import *
+import aiosqlite
+import json
+import asyncio
+from datetime import datetime, timezone
+import base64
+import io
+from typing import List, Dict, Any, Optional
+import random
+import string
+
+class BackupView(discord.ui.View):
+    """Unified backup system interface"""
+
+    def __init__(self, bot, guild_id, timeout=300):
+        super().__init__(timeout=timeout)
+        self.bot = bot
+        self.guild_id = guild_id
+
+    async def create_main_embed(self):
+        """Create main backup interface embed with bot info"""
+        async with aiosqlite.connect('bot.db') as db:
+            cursor = await db.execute('''
+                SELECT backup_name, backup_key, created_at, backup_size 
+                FROM server_backups 
+                WHERE guild_id = ? 
+                ORDER BY created_at DESC LIMIT 5
+            ''', (self.guild_id,))
+            backups = await cursor.fetchall()
+
+        embed = create_embed(
+            title="server backup system",
+            description="complete server backup, restore and migration control panel",
+            color=0x3498DB
+        )
+
+        # Add bot info to embed
+        if self.bot.user:
+            embed.set_author(
+                name=f"{self.bot.user.display_name} backup system",
+                icon_url=self.bot.user.avatar.url if self.bot.user.avatar else self.bot.user.default_avatar.url
+            )
+
+        if backups:
+            backup_list = []
+            for backup in backups[:5]:
+                name, key, created_at, size = backup
+                size_mb = size / 1024 / 1024 if size else 0
+                backup_list.append(f"**{name}** - `{key[:8]}...` ({size_mb:.1f}MB)")
+
+            embed.add_field(
+                name="recent backups",
+                value="\n".join(backup_list),
+                inline=False
+            )
+        else:
+            embed.add_field(
+                name="recent backups",
+                value="no backups found - create your first backup",
+                inline=False
+            )
+
+        embed.add_field(
+            name="available actions",
+            value="â¢ **create** - backup current server\nâ¢ **restore** - restore from backup\nâ¢ **list** - view all backups\nâ¢ **delete** - remove backups\nâ¢ **migrate** - clone from another server\nâ¢ **import JSON** - import from JSON file\nâ¢ **export JSON** - export as JSON file",
+            inline=False
+        )
+
+        embed.add_field(
+            name="backup includes",
+            value="â¢ server settings and permissions\nâ¢ roles, channels, categories\nâ¢ member role assignments and nicknames\nâ¢ emojis, stickers with file data\nâ¢ automod rules and webhooks\nâ¢ messages (100 per channel) with webhook restoration\nâ¢ bans, invites, scheduled events\nâ¢ **JSON import/export support**\nâ¢ **max 5 backups per server**",
+            inline=False
+        )
+
+        embed.set_footer(text="select an action below â¢ the discord bot")
+        return embed
+
+    @discord.ui.button(label="create backup", style=discord.ButtonStyle.green, row=0)
+    async def create_backup(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Create a new server backup"""
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(
+                embed=create_error_embed("administrator permission required"),
+                ephemeral=True
+            )
+            return
+
+        modal = BackupNameModal()
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="restore backup", style=discord.ButtonStyle.primary, row=0)
+    async def restore_backup(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Restore from backup"""
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(
+                embed=create_error_embed("administrator permission required"),
+                ephemeral=True
+            )
+            return
+
+        view = RestoreSelectView(self.bot, self.guild_id)
+        embed = await view.create_restore_embed()
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+    @discord.ui.button(label="list backups", style=discord.ButtonStyle.secondary, row=0)
+    async def list_backups(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """List all backups"""
+        view = BackupListView(self.bot, self.guild_id)
+        embed = await view.create_list_embed()
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+    @discord.ui.button(label="delete backup", style=discord.ButtonStyle.danger, row=1)
+    async def delete_backup(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Delete backups"""
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(
+                embed=create_error_embed("administrator permission required"),
+                ephemeral=True
+            )
+            return
+
+        view = DeleteSelectView(self.bot, self.guild_id)
+        embed = await view.create_delete_embed()
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+    @discord.ui.button(label="migrate server", style=discord.ButtonStyle.secondary, emoji="ð", row=1)
+    async def migrate_server(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Migrate from another server"""
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(
+                embed=create_error_embed("administrator permission required"),
+                ephemeral=True
+            )
+            return
+
+        modal = MigrateModal(self.bot, self.guild_id)
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="import JSON", style=discord.ButtonStyle.secondary, emoji="ð¥", row=2)
+    async def import_json(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Import backup from JSON file"""
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(
+                embed=create_error_embed("administrator permission required"),
+                ephemeral=True
+            )
+            return
+
+        modal = JSONImportModal(self.bot, self.guild_id)
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="export JSON", style=discord.ButtonStyle.secondary, emoji="ð¤", row=2)
+    async def export_json(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Export backup to JSON file"""
+        view = JSONExportSelectView(self.bot, self.guild_id)
+        embed = await view.create_export_embed()
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+class BackupNameModal(discord.ui.Modal, title="create server backup"):
+    def __init__(self):
+        super().__init__()
+
+    backup_name = discord.ui.TextInput(
+        label="backup name",
+        placeholder="enter a name for this backup...",
+        max_length=50,
+        required=True
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not interaction.guild:
+            await interaction.response.send_message("This command can only be used in a server!", ephemeral=True)
+            return
+
+        # Check backup limit (max 5 per server)
+        async with aiosqlite.connect('bot.db') as db:
+            cursor = await db.execute('''
+                SELECT COUNT(*) FROM server_backups WHERE guild_id = ?
+            ''', (interaction.guild.id,))
+            backup_count = await cursor.fetchone()
+
+            if backup_count and backup_count[0] >= 5:
+                # Delete oldest backup
+                await db.execute('''
+                    DELETE FROM server_backups 
+                    WHERE guild_id = ? AND id = (
+                        SELECT id FROM server_backups 
+                        WHERE guild_id = ? 
+                        ORDER BY created_at ASC 
+                        LIMIT 1
+                    )
+                ''', (interaction.guild.id, interaction.guild.id))
+                await db.commit()
+
+        embed = create_embed("â³ creating backup", "this may take a few minutes...")
+        if interaction.client.user:
+            embed.set_author(
+                name=f"{interaction.client.user.display_name} backup system",
+                icon_url=interaction.client.user.avatar.url if interaction.client.user.avatar else interaction.client.user.default_avatar.url
+            )
+
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+        # Create backup in background
+        try:
+            backup_key = await self.create_full_backup(interaction.guild, self.backup_name.value)
+
+            success_embed = create_success_embed(f"backup created successfully!\nbackup key: `{backup_key}`")
+            if interaction.client.user:
+                success_embed.set_author(
+                    name=f"{interaction.client.user.display_name} backup system",
+                    icon_url=interaction.client.user.avatar.url if interaction.client.user.avatar else interaction.client.user.default_avatar.url
+                )
+
+            await interaction.edit_original_response(embed=success_embed)
+        except Exception as e:
+            error_embed = create_error_embed(f"backup failed: {str(e)}")
+            await interaction.edit_original_response(embed=error_embed)
+
+    async def create_full_backup(self, guild: discord.Guild, backup_name: str) -> str:
+        """Create complete server backup"""
+        backup_key = ''.join(random.choices(string.ascii_letters + string.digits, k=16))
+
+        # Collect all server data
+        backup_data = {
+            "guild_info": {
+                "name": guild.name,
+                "description": guild.description,
+                "icon_url": str(guild.icon.url) if guild.icon else None,
+                "banner_url": str(guild.banner.url) if guild.banner else None,
+                "splash_url": str(guild.splash.url) if guild.splash else None,
+                "verification_level": guild.verification_level.value,
+                "explicit_content_filter": guild.explicit_content_filter.value,
+                "default_notifications": guild.default_notifications.value,
+                "vanity_url": guild.vanity_url_code,
+                "afk_timeout": guild.afk_timeout,
+                "afk_channel": guild.afk_channel.id if guild.afk_channel else None,
+                "system_channel": guild.system_channel.id if guild.system_channel else None,
+                "rules_channel": guild.rules_channel.id if guild.rules_channel else None,
+                "public_updates_channel": guild.public_updates_channel.id if guild.public_updates_channel else None
+            },
+            "roles": [],
+            "channels": {"categories": [], "text_channels": [], "voice_channels": [], "threads": []},
+            "emojis_stickers": {"emojis": [], "stickers": []},
+            "messages": {},
+            "member_roles": {},
+            "automod_rules": [],
+            "bans": [],
+            "webhooks": [],
+            "integrations": [],
+            "invites": [],
+            "scheduled_events": [],
+            "stage_instances": []
+        }
+
+        # Backup roles (exclude @everyone and bot roles)
+        for role in guild.roles:
+            if role.name != "@everyone" and not role.managed:  # Skip bot roles (managed roles)
+                backup_data["roles"].append({
+                    "name": role.name,
+                    "color": role.color.value,
+                    "hoist": role.hoist,
+                    "mentionable": role.mentionable,
+                    "permissions": role.permissions.value,
+                    "position": role.position
+                })
+
+        # Backup member roles and nicknames
+        for member in guild.members:
+            if not member.bot:  # Skip bots
+                member_roles = [role.name for role in member.roles if role.name != "@everyone" and not role.managed]  # Skip bot roles
+                backup_data["member_roles"][str(member.id)] = {
+                    "username": member.name,
+                    "display_name": member.display_name,
+                    "nickname": member.nick,
+                    "roles": member_roles
+                }
+
+        # Backup emojis and stickers with file data
+        for emoji in guild.emojis:
+            try:
+                # Download emoji data
+                import aiohttp
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(str(emoji.url)) as resp:
+                        if resp.status == 200:
+                            emoji_data = await resp.read()
+                            backup_data["emojis_stickers"]["emojis"].append({
+                                "name": emoji.name,
+                                "url": str(emoji.url),
+                                "animated": emoji.animated,
+                                "available": emoji.available,
+                                "data": base64.b64encode(emoji_data).decode('utf-8')
+                            })
+            except:
+                # Fallback without data
+                backup_data["emojis_stickers"]["emojis"].append({
+                    "name": emoji.name,
+                    "url": str(emoji.url),
+                    "animated": emoji.animated,
+                    "available": emoji.available,
+                    "data": None
+                })
+
+        for sticker in guild.stickers:
+            try:
+                # Download sticker data
+                import aiohttp
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(str(sticker.url)) as resp:
+                        if resp.status == 200:
+                            sticker_data = await resp.read()
+                            backup_data["emojis_stickers"]["stickers"].append({
+                                "name": sticker.name,
+                                "description": sticker.description,
+                                "url": str(sticker.url),
+                                "format": sticker.format.name,
+                                "data": base64.b64encode(sticker_data).decode('utf-8')
+                            })
+            except:
+                # Fallback without data
+                backup_data["emojis_stickers"]["stickers"].append({
+                    "name": sticker.name,
+                    "description": sticker.description,
+                    "url": str(sticker.url),
+                    "format": sticker.format.name,
+                    "data": None
+                })
+
+        # Backup channels
+        for category in guild.categories:
+            backup_data["channels"]["categories"].append({
+                "name": category.name,
+                "position": category.position,
+                "overwrites": self.serialize_overwrites(category.overwrites)
+            })
+
+        for channel in guild.text_channels:
+            backup_data["channels"]["text_channels"].append({
+                "name": channel.name,
+                "topic": channel.topic,
+                "position": channel.position,
+                "category": channel.category.name if channel.category else None,
+                "nsfw": channel.nsfw,
+                "slowmode_delay": channel.slowmode_delay,
+                "overwrites": self.serialize_overwrites(channel.overwrites)
+            })
+
+        for channel in guild.voice_channels:
+            backup_data["channels"]["voice_channels"].append({
+                "name": channel.name,
+                "position": channel.position,
+                "category": channel.category.name if channel.category else None,
+                "user_limit": channel.user_limit,
+                "bitrate": channel.bitrate,
+                "overwrites": self.serialize_overwrites(channel.overwrites)
+            })
+
+        # Backup stage channels
+        backup_data["channels"]["stage_channels"] = []
+        for channel in guild.stage_channels:
+            backup_data["channels"]["stage_channels"].append({
+                "name": channel.name,
+                "position": channel.position,
+                "category": channel.category.name if channel.category else None,
+                "user_limit": channel.user_limit,
+                "bitrate": channel.bitrate,
+                "overwrites": self.serialize_overwrites(channel.overwrites)
+            })
+
+        # Backup forum channels
+        backup_data["channels"]["forum_channels"] = []
+        for channel in guild.forums:
+            backup_data["channels"]["forum_channels"].append({
+                "name": channel.name,
+                "topic": channel.topic,
+                "position": channel.position,
+                "category": channel.category.name if channel.category else None,
+                "nsfw": channel.nsfw,
+                "slowmode_delay": channel.slowmode_delay,
+                "overwrites": self.serialize_overwrites(channel.overwrites)
+            })
+
+        # Backup webhooks
+        for channel in guild.text_channels:
+            try:
+                webhooks = await channel.webhooks()
+                for webhook in webhooks:
+                    backup_data["webhooks"].append({
+                        "name": webhook.name,
+                        "channel": channel.name,
+                        "avatar_url": str(webhook.avatar.url) if webhook.avatar else None,
+                        "url": webhook.url  # Note: This can't be restored directly
+                    })
+            except (discord.Forbidden, discord.HTTPException):
+                continue
+
+        # Backup automod rules (if any)
+        try:
+            automod_rules = await guild.fetch_automod_rules()
+            for rule in automod_rules:
+                backup_data["automod_rules"].append({
+                    "name": rule.name,
+                    "enabled": rule.enabled,
+                    "event_type": rule.event_type.value,
+                    "trigger_type": rule.trigger.type.value if rule.trigger else None,
+                    "actions": [{"type": action.type.value} for action in rule.actions]
+                })
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+        # Backup messages from all text channels (up to 100 per channel)
+        for channel in guild.text_channels:
+            try:
+                messages = []
+                async for message in channel.history(limit=100):
+                    if not message.author.bot:  # Skip bot messages
+                        message_data = {
+                            "content": message.content,
+                            "author_id": message.author.id,
+                            "author_name": message.author.display_name,
+                            "author_avatar": str(message.author.display_avatar.url),
+                            "timestamp": message.created_at.isoformat(),
+                            "attachments": [],
+                            "embeds": []
+                        }
+                        
+                        # Backup attachments (URLs only for restoration)
+                        for attachment in message.attachments:
+                            message_data["attachments"].append({
+                                "filename": attachment.filename,
+                                "url": attachment.url,
+                                "size": attachment.size
+                            })
+                        
+                        # Backup embeds
+                        for embed in message.embeds:
+                            if embed.title or embed.description:
+                                message_data["embeds"].append({
+                                    "title": embed.title,
+                                    "description": embed.description,
+                                    "color": embed.color.value if embed.color else None
+                                })
+                        
+                        messages.append(message_data)
+                
+                if messages:
+                    backup_data["messages"][channel.name] = messages
+            except (discord.Forbidden, discord.HTTPException):
+                continue
+
+        # Backup bans
+        try:
+            async for ban in guild.bans():
+                backup_data["bans"].append({
+                    "user_id": ban.user.id,
+                    "username": ban.user.name,
+                    "reason": ban.reason or "No reason provided"
+                })
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+        # Backup invites
+        try:
+            invites = await guild.invites()
+            for invite in invites:
+                backup_data["invites"].append({
+                    "code": invite.code,
+                    "channel": invite.channel.name if invite.channel else None,
+                    "max_uses": invite.max_uses,
+                    "uses": invite.uses,
+                    "temporary": invite.temporary,
+                    "created_by": invite.inviter.name if invite.inviter else None
+                })
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+        # Backup scheduled events
+        try:
+            events = guild.scheduled_events
+            for event in events:
+                backup_data["scheduled_events"].append({
+                    "name": event.name,
+                    "description": event.description,
+                    "start_time": event.start_time.isoformat() if event.start_time else None,
+                    "end_time": event.end_time.isoformat() if event.end_time else None,
+                    "location": event.location,
+                    "entity_type": event.entity_type.value
+                })
+        except:
+            pass
+
+        # Save to database
+        backup_json = json.dumps(backup_data)
+        backup_size = len(backup_json.encode('utf-8'))
+
+        async with aiosqlite.connect('bot.db') as db:
+            await db.execute('''
+                INSERT INTO server_backups (guild_id, backup_name, backup_key, backup_data, backup_size, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (guild.id, backup_name, backup_key, backup_json, backup_size, datetime.now(timezone.utc).isoformat()))
+            await db.commit()
+
+        return backup_key
+
+    def serialize_overwrites(self, overwrites):
+        """Serialize channel overwrites"""
+        serialized = []
+        for target, overwrite in overwrites.items():
+            serialized.append({
+                "id": target.id,
+                "type": "role" if isinstance(target, discord.Role) else "member",
+                "allow": overwrite.pair()[0].value,
+                "deny": overwrite.pair()[1].value
+            })
+        return serialized
+
+class RestoreSelectView(discord.ui.View):
+    """Restore backup selection"""
+    def __init__(self, bot, guild_id):
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.guild_id = guild_id
+
+    async def create_restore_embed(self):
+        """Create restore selection embed"""
+        async with aiosqlite.connect('bot.db') as db:
+            cursor = await db.execute('''
+                SELECT backup_name, backup_key, created_at, backup_size 
+                FROM server_backups 
+                WHERE guild_id = ? 
+                ORDER BY created_at DESC LIMIT 25
+            ''', (self.guild_id,))
+            backups = await cursor.fetchall()
+
+        embed = create_embed(
+            title="ð restore backup",
+            description="select a backup to restore from the dropdown below",
+            color=0xE74C3C
+        )
+
+        embed.set_author(
+            name=f"{self.bot.user.display_name} restore system",
+            icon_url=self.bot.user.avatar.url if self.bot.user.avatar else self.bot.user.default_avatar.url
+        )
+
+        if backups:
+            # Add restore select menu
+            options = []
+            for backup in backups:
+                name, key, created_at, size = backup
+                size_mb = size / 1024 / 1024 if size else 0
+                options.append(discord.SelectOption(
+                    label=f"{name} ({size_mb:.1f}MB)",
+                    value=key,
+                    description=f"created: {created_at[:10]} â¢ key: {key[:8]}..."
+                ))
+
+            select = RestoreSelect(self.bot, options)
+            self.add_item(select)
+
+            embed.add_field(
+                name="restore warning",
+                value="**warning: this will wipe your server**\nâ¢ all channels, roles, emojis deleted\nâ¢ then rebuilt from backup\nâ¢ this action cannot be undone",
+                inline=False
+            )
+        else:
+            embed.description = "no backups found - create a backup first!"
+
+        return embed
+
+class RestoreSelect(discord.ui.Select):
+    """Select menu for backup restoration"""
+    def __init__(self, bot, options):
+        super().__init__(
+            placeholder="choose a backup to restore...",
+            options=options,
+            min_values=1,
+            max_values=1
+        )
+        self.bot = bot
+
+    async def callback(self, interaction: discord.Interaction):
+        backup_key = self.values[0]
+
+        # Create confirmation view
+        view = RestoreConfirmView(self.bot, backup_key)
+        embed = create_embed(
+            title="server restoration",
+            description=f"**warning: this will completely wipe your server**\n\nrestore backup `{backup_key[:8]}...`?\n\n**everything will be deleted:**\nâ¢ all channels, categories, roles\nâ¢ all emojis, stickers, webhooks\nâ¢ all member roles and nicknames\nâ¢ all automod rules\n\n**then rebuilt from backup data**",
+            color=0xFF0000
+        )
+
+        embed.set_author(
+            name=f"{self.bot.user.display_name} restore confirmation",
+            icon_url=self.bot.user.avatar.url if self.bot.user.avatar else self.bot.user.default_avatar.url
+        )
+
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+class RestoreConfirmView(discord.ui.View):
+    """Confirmation view for backup restoration"""
+    def __init__(self, bot, backup_key):
+        super().__init__(timeout=60)
+        self.bot = bot
+        self.backup_key = backup_key
+
+    @discord.ui.button(label="confirm restore", style=discord.ButtonStyle.danger)
+    async def confirm_restore(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.guild:
+            await interaction.response.send_message("This command can only be used in a server!", ephemeral=True)
+            return
+
+        embed = create_embed("server restoration in progress", "phase 1: deleting everything...\nphase 2: rebuilding from backup...\n\nthis may take 5-10 minutes...")
+        embed.set_author(
+            name=f"{self.bot.user.display_name} restore system",
+            icon_url=self.bot.user.avatar.url if self.bot.user.avatar else self.bot.user.default_avatar.url
+        )
+
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+        try:
+            await self.restore_backup(interaction.guild, self.backup_key)
+            success_embed = create_success_embed("server restoration completed\nserver completely wiped and rebuilt from backup")
+            success_embed.set_author(
+                name=f"{self.bot.user.display_name} restore system",
+                icon_url=self.bot.user.avatar.url if self.bot.user.avatar else self.bot.user.default_avatar.url
+            )
+            success_embed.add_field(
+                name="restoration complete",
+                value="**phase 1:** everything deleted\nâ¢ all roles, channels, categories\nâ¢ all emojis, stickers, webhooks\nâ¢ all member roles and nicknames\n\n**phase 2:** rebuilt from backup\nâ¢ server settings restored\nâ¢ all content recreated\nâ¢ member assignments restored\nâ¢ messages restored via webhooks\nâ¢ bans reinstated",
+                inline=False
+            )
+            await interaction.edit_original_response(embed=success_embed)
+        except Exception as e:
+            error_embed = create_error_embed(f"server restore failed: {str(e)}")
+            error_embed.add_field(
+                name="critical issues",
+                value="â¢ bot lacks administrator permissions\nâ¢ backup corrupted or invalid\nâ¢ server may be partially destroyed",
+                inline=False
+            )
+            await interaction.edit_original_response(embed=error_embed)
+
+    @discord.ui.button(label="cancel", style=discord.ButtonStyle.secondary)
+    async def cancel_restore(self, interaction: discord.Interaction, button: discord.ui.Button):
+        embed = create_embed("restore cancelled", "no changes were made to your server")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    async def restore_backup(self, guild: discord.Guild, backup_key: str):
+        """DESTRUCTIVE RESTORE - Wipes everything then rebuilds from backup"""
+        async with aiosqlite.connect('bot.db') as db:
+            cursor = await db.execute('''
+                SELECT backup_data FROM server_backups WHERE backup_key = ?
+            ''', (backup_key,))
+            result = await cursor.fetchone()
+
+            if not result:
+                raise Exception("backup not found")
+
+            backup_data = json.loads(result[0])
+
+        # PHASE 1: DESTROY EVERYTHING (except @everyone role and bot)
+        destruction_count = 0
+
+        # 1. Delete all custom emojis
+        for emoji in guild.emojis:
+            try:
+                await emoji.delete(reason=f"destructive restore from backup {backup_key[:8]}")
+                destruction_count += 1
+            except (discord.Forbidden, discord.HTTPException):
+                continue
+
+        # 2. Delete all stickers
+        for sticker in guild.stickers:
+            try:
+                await sticker.delete(reason=f"destructive restore from backup {backup_key[:8]}")
+                destruction_count += 1
+            except (discord.Forbidden, discord.HTTPException):
+                continue
+
+        # 3. Remove all member roles (except @everyone)
+        for member in guild.members:
+            if not member.bot:
+                try:
+                    roles_to_remove = [role for role in member.roles if role.name != "@everyone"]
+                    if roles_to_remove:
+                        await member.remove_roles(*roles_to_remove, reason=f"destructive restore from backup {backup_key[:8]}")
+                    # Remove nicknames
+                    if member.nick:
+                        await member.edit(nick=None, reason=f"destructive restore from backup {backup_key[:8]}")
+                except (discord.Forbidden, discord.HTTPException):
+                    continue
+
+        # 4. Delete all text channels
+        for channel in guild.text_channels:
+            try:
+                await channel.delete(reason=f"destructive restore from backup {backup_key[:8]}")
+                destruction_count += 1
+            except (discord.Forbidden, discord.HTTPException):
+                continue
+
+        # 5. Delete all voice channels
+        for channel in guild.voice_channels:
+            try:
+                await channel.delete(reason=f"destructive restore from backup {backup_key[:8]}")
+                destruction_count += 1
+            except (discord.Forbidden, discord.HTTPException):
+                continue
+
+        # 6. Delete all categories
+        for category in guild.categories:
+            try:
+                await category.delete(reason=f"destructive restore from backup {backup_key[:8]}")
+                destruction_count += 1
+            except (discord.Forbidden, discord.HTTPException):
+                continue
+
+        # 7. Delete all custom roles (except @everyone and bot roles)
+        bot_roles = set()
+        for member in guild.members:
+            if member.bot:
+                bot_roles.update(member.roles)
+
+        for role in guild.roles:
+            if role.name != "@everyone" and role not in bot_roles and not role.managed:
+                try:
+                    await role.delete(reason=f"destructive restore from backup {backup_key[:8]}")
+                    destruction_count += 1
+                except (discord.Forbidden, discord.HTTPException):
+                    continue
+
+        # 8. Delete all webhooks
+        for channel in list(guild.text_channels) + list(guild.forums):
+            try:
+                webhooks = await channel.webhooks()
+                for webhook in webhooks:
+                    try:
+                        await webhook.delete(reason=f"destructive restore from backup {backup_key[:8]}")
+                        destruction_count += 1
+                    except (discord.Forbidden, discord.HTTPException):
+                        continue
+            except (discord.Forbidden, discord.HTTPException):
+                continue
+
+        # 9. Delete automod rules
+        try:
+            automod_rules = await guild.fetch_automod_rules()
+            for rule in automod_rules:
+                try:
+                    await rule.delete(reason=f"destructive restore from backup {backup_key[:8]}")
+                    destruction_count += 1
+                except (discord.Forbidden, discord.HTTPException):
+                    continue
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+        # 10. Delete all integrations and scheduled events
+        try:
+            events = await guild.fetch_scheduled_events()
+            for event in events:
+                try:
+                    await event.delete(reason=f"destructive restore from backup {backup_key[:8]}")
+                    destruction_count += 1
+                except (discord.Forbidden, discord.HTTPException):
+                    continue
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+        # 11. Delete all stage channels and forum channels
+        for channel in list(guild.stage_channels) + list(guild.forums):
+            try:
+                await channel.delete(reason=f"destructive restore from backup {backup_key[:8]}")
+                destruction_count += 1
+            except (discord.Forbidden, discord.HTTPException):
+                continue
+
+        # 12. Delete all threads
+        for channel in guild.text_channels:
+            try:
+                threads = channel.threads
+                for thread in threads:
+                    try:
+                        await thread.delete(reason=f"destructive restore from backup {backup_key[:8]}")
+                        destruction_count += 1
+                    except (discord.Forbidden, discord.HTTPException):
+                        continue
+            except (discord.Forbidden, discord.HTTPException):
+                continue
+
+        # PHASE 2: REBUILD FROM BACKUP
+        restored_count = 0
+
+        # 1. Restore server info
+        guild_info = backup_data.get("guild_info", {})
+        if guild_info:
+            try:
+                edit_kwargs = {}
+                if guild_info.get("name"): edit_kwargs["name"] = guild_info["name"]
+                if guild_info.get("description"): edit_kwargs["description"] = guild_info["description"]
+                if guild_info.get("verification_level") is not None:
+                    edit_kwargs["verification_level"] = discord.VerificationLevel(guild_info["verification_level"])
+                if guild_info.get("explicit_content_filter") is not None:
+                    edit_kwargs["explicit_content_filter"] = discord.ContentFilter(guild_info["explicit_content_filter"])
+                if guild_info.get("default_notifications") is not None:
+                    edit_kwargs["default_notifications"] = discord.NotificationLevel(guild_info["default_notifications"])
+
+                if edit_kwargs:
+                    await guild.edit(**edit_kwargs)
+                    restored_count += 1
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+
+        # 2. Recreate all roles
+        role_mapping = {}
+        for role_data in backup_data.get("roles", []):
+            try:
+                new_role = await guild.create_role(
+                    name=role_data["name"],
+                    color=discord.Color(role_data["color"]),
+                    hoist=role_data["hoist"],
+                    mentionable=role_data["mentionable"],
+                    permissions=discord.Permissions(role_data["permissions"]),
+                    reason=f"restored from backup {backup_key[:8]}"
+                )
+                role_mapping[role_data["name"]] = new_role
+                restored_count += 1
+            except (discord.Forbidden, discord.HTTPException):
+                continue
+
+        # 3. Recreate all categories
+        category_mapping = {}
+        channel_mapping = {}
+        for cat_data in backup_data.get("channels", {}).get("categories", []):
+            try:
+                overwrites = self.deserialize_overwrites(cat_data.get("overwrites", []), guild, role_mapping)
+                new_category = await guild.create_category(
+                    name=cat_data["name"],
+                    overwrites=overwrites,
+                    reason=f"restored from backup {backup_key[:8]}"
+                )
+                category_mapping[cat_data["name"]] = new_category
+                restored_count += 1
+            except (discord.Forbidden, discord.HTTPException):
+                continue
+
+        # 4. Recreate all text channels
+        for ch_data in backup_data.get("channels", {}).get("text_channels", []):
+            try:
+                overwrites = self.deserialize_overwrites(ch_data.get("overwrites", []), guild, role_mapping)
+                category = category_mapping.get(ch_data.get("category")) if ch_data.get("category") else None
+
+                new_channel = await guild.create_text_channel(
+                    name=ch_data["name"],
+                    topic=ch_data.get("topic"),
+                    category=category,
+                    nsfw=ch_data.get("nsfw", False),
+                    slowmode_delay=ch_data.get("slowmode_delay", 0),
+                    overwrites=overwrites,
+                    reason=f"restored from backup {backup_key[:8]}"
+                )
+                channel_mapping[ch_data["name"]] = new_channel
+                restored_count += 1
+            except (discord.Forbidden, discord.HTTPException):
+                continue
+
+        # 5. Recreate all voice channels
+        for vc_data in backup_data.get("channels", {}).get("voice_channels", []):
+            try:
+                overwrites = self.deserialize_overwrites(vc_data.get("overwrites", []), guild, role_mapping)
+                category = category_mapping.get(vc_data.get("category")) if vc_data.get("category") else None
+
+                new_voice = await guild.create_voice_channel(
+                    name=vc_data["name"],
+                    category=category,
+                    user_limit=vc_data.get("user_limit", 0),
+                    bitrate=min(vc_data.get("bitrate", 64000), guild.bitrate_limit),
+                    overwrites=overwrites,
+                    reason=f"restored from backup {backup_key[:8]}"
+                )
+                restored_count += 1
+            except (discord.Forbidden, discord.HTTPException):
+                continue
+
+        # 5a. Recreate all stage channels
+        for stage_data in backup_data.get("channels", {}).get("stage_channels", []):
+            try:
+                overwrites = self.deserialize_overwrites(stage_data.get("overwrites", []), guild, role_mapping)
+                category = category_mapping.get(stage_data.get("category")) if stage_data.get("category") else None
+
+                new_stage = await guild.create_stage_channel(
+                    name=stage_data["name"],
+                    category=category,
+                    user_limit=stage_data.get("user_limit", 0),
+                    bitrate=min(stage_data.get("bitrate", 64000), guild.bitrate_limit),
+                    overwrites=overwrites,
+                    reason=f"restored from backup {backup_key[:8]}"
+                )
+                restored_count += 1
+            except (discord.Forbidden, discord.HTTPException):
+                continue
+
+        # 5b. Recreate all forum channels
+        for forum_data in backup_data.get("channels", {}).get("forum_channels", []):
+            try:
+                overwrites = self.deserialize_overwrites(forum_data.get("overwrites", []), guild, role_mapping)
+                category = category_mapping.get(forum_data.get("category")) if forum_data.get("category") else None
+
+                new_forum = await guild.create_forum(
+                    name=forum_data["name"],
+                    topic=forum_data.get("topic"),
+                    category=category,
+                    nsfw=forum_data.get("nsfw", False),
+                    slowmode_delay=forum_data.get("slowmode_delay", 0),
+                    overwrites=overwrites,
+                    reason=f"restored from backup {backup_key[:8]}"
+                )
+                channel_mapping[forum_data["name"]] = new_forum
+                restored_count += 1
+            except (discord.Forbidden, discord.HTTPException):
+                continue
+
+        # 6. Restore member role assignments and nicknames
+        members_restored = 0
+        if backup_data.get("member_roles"):
+            for member_id, member_data in backup_data["member_roles"].items():
+                try:
+                    member = guild.get_member(int(member_id))
+                    if member and not member.bot:
+                        # Restore nickname
+                        if member_data.get("nickname"):
+                            try:
+                                await member.edit(nick=member_data["nickname"], reason=f"restored from backup {backup_key[:8]}")
+                            except (discord.Forbidden, discord.HTTPException):
+                                pass
+
+                        # Restore roles
+                        roles_to_add = []
+                        for role_name in member_data.get("roles", []):
+                            role = role_mapping.get(role_name)
+                            if role:
+                                roles_to_add.append(role)
+
+                        if roles_to_add:
+                            await member.add_roles(*roles_to_add, reason=f"restored from backup {backup_key[:8]}")
+                            members_restored += 1
+                except (discord.Forbidden, discord.HTTPException, ValueError):
+                    continue
+
+        # 7. Restore emojis
+        emojis_restored = 0
+        for emoji_data in backup_data.get("emojis_stickers", {}).get("emojis", []):
+            try:
+                if emoji_data.get("data"):
+                    emoji_bytes = base64.b64decode(emoji_data["data"])
+                    new_emoji = await guild.create_custom_emoji(
+                        name=emoji_data["name"],
+                        image=emoji_bytes,
+                        reason=f"restored from backup {backup_key[:8]}"
+                    )
+                    emojis_restored += 1
+            except (discord.Forbidden, discord.HTTPException):
+                continue
+
+        # 8. Restore stickers
+        stickers_restored = 0
+        for sticker_data in backup_data.get("emojis_stickers", {}).get("stickers", []):
+            try:
+                if sticker_data.get("data"):
+                    sticker_bytes = base64.b64decode(sticker_data["data"])
+                    new_sticker = await guild.create_sticker(
+                        name=sticker_data["name"],
+                        description=sticker_data.get("description", "Restored sticker"),
+                        emoji="ð",
+                        file=discord.File(io.BytesIO(sticker_bytes), filename=f"{sticker_data['name']}.png"),
+                        reason=f"restored from backup {backup_key[:8]}"
+                    )
+                    stickers_restored += 1
+            except (discord.Forbidden, discord.HTTPException):
+                continue
+
+        # 9. Restore messages via webhooks (preserving original usernames and avatars)
+        messages_restored = 0
+        if backup_data.get("messages"):
+            for channel_name, messages in backup_data["messages"].items():
+                channel = channel_mapping.get(channel_name)
+                if not channel:
+                    continue
+                
+                try:
+                    # Create a webhook for message restoration
+                    webhook = await channel.create_webhook(
+                        name=f"restore-{backup_key[:8]}",
+                        reason=f"message restoration from backup {backup_key[:8]}"
+                    )
+                    
+                    # Restore messages in reverse order (oldest first)
+                    for message_data in reversed(messages):
+                        try:
+                            # Build message content
+                            content = message_data.get("content", "")
+                            
+                            # Add embed content if present
+                            embeds = []
+                            for embed_data in message_data.get("embeds", []):
+                                embed = discord.Embed(
+                                    title=embed_data.get("title"),
+                                    description=embed_data.get("description"),
+                                    color=embed_data.get("color")
+                                )
+                                embeds.append(embed)
+                            
+                            # Add attachment info to content if present
+                            if message_data.get("attachments"):
+                                attachment_text = "\n".join([
+                                    f"ð {att['filename']} ({att['size']} bytes)"
+                                    for att in message_data["attachments"]
+                                ])
+                                if content:
+                                    content += f"\n\n{attachment_text}"
+                                else:
+                                    content = attachment_text
+                            
+                            # Send via webhook with original username and avatar
+                            if content or embeds:
+                                await webhook.send(
+                                    content=content or None,
+                                    embeds=embeds if embeds else None,
+                                    username=message_data.get("author_name", "Unknown User"),
+                                    avatar_url=message_data.get("author_avatar"),
+                                    wait=False
+                                )
+                                messages_restored += 1
+                                
+                        except (discord.HTTPException, discord.Forbidden):
+                            continue
+                    
+                    # Clean up webhook after restoration
+                    try:
+                        await webhook.delete(reason="message restoration completed")
+                    except:
+                        pass
+                        
+                except (discord.Forbidden, discord.HTTPException):
+                    continue
+
+        # 10. Restore bans
+        bans_restored = 0
+        for ban_data in backup_data.get("bans", []):
+            try:
+                user_id = ban_data.get("user_id")
+                reason = ban_data.get("reason", "Restored from backup")
+                
+                # Create a mock user object for banning
+                user = discord.Object(id=user_id)
+                await guild.ban(user, reason=f"restored ban: {reason}")
+                bans_restored += 1
+            except (discord.Forbidden, discord.HTTPException, discord.NotFound):
+                continue
+
+        if destruction_count == 0 and restored_count == 0:
+            raise Exception("no items could be destroyed or restored (insufficient permissions)")
+
+        total_operations = destruction_count + restored_count + members_restored + emojis_restored + stickers_restored + messages_restored + bans_restored
+
+    def deserialize_overwrites(self, overwrites_data, guild, role_mapping):
+        """Convert serialized overwrites back to discord overwrites"""
+        overwrites = {}
+
+        for overwrite_data in overwrites_data:
+            target_id = overwrite_data["id"]
+            overwrite_type = overwrite_data["type"]
+            allow = discord.Permissions(overwrite_data["allow"])
+            deny = discord.Permissions(overwrite_data["deny"])
+
+            if overwrite_type == "role":
+                # Find role by ID or by name in mapping
+                target = guild.get_role(target_id)
+                if not target:
+                    # Try to find in our role mapping
+                    for role_name, role_obj in role_mapping.items():
+                        if role_obj.id == target_id:
+                            target = role_obj
+                            break
+
+                if target:
+                    overwrites[target] = discord.PermissionOverwrite.from_pair(allow, deny)
+
+            elif overwrite_type == "member":
+                target = guild.get_member(target_id)
+                if target:
+                    overwrites[target] = discord.PermissionOverwrite.from_pair(allow, deny)
+
+        return overwrites
+
+class BackupListView(discord.ui.View):
+    """List all backups"""
+    def __init__(self, bot, guild_id):
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.guild_id = guild_id
+
+    async def create_list_embed(self):
+        """Create backup list embed"""
+        async with aiosqlite.connect('bot.db') as db:
+            cursor = await db.execute('''
+                SELECT backup_name, backup_key, created_at, backup_size 
+                FROM server_backups 
+                WHERE guild_id = ? 
+                ORDER BY created_at DESC
+            ''', (self.guild_id,))
+            backups = await cursor.fetchall()
+
+        embed = create_embed(
+            title="ð all backups",
+            color=0x3498DB
+        )
+
+        embed.set_author(
+            name=f"{self.bot.user.display_name} backup list",
+            icon_url=self.bot.user.avatar.url if self.bot.user.avatar else self.bot.user.default_avatar.url
+        )
+
+        if backups:
+            backup_list = []
+            for backup in backups:
+                name, key, created_at, size = backup
+                if size:
+                    if size < 1024 * 1024:  # Less than 1MB, show in KB
+                        size_kb = size / 1024
+                        size_display = f"{size_kb:.1f}KB"
+                    else:  # 1MB or more, show in MB
+                        size_mb = size / 1024 / 1024
+                        size_display = f"{size_mb:.1f}MB"
+                else:
+                    size_display = "0KB"
+                backup_list.append(f"**{name}**\n`{key}` â¢ {created_at[:10]} â¢ {size_display}")
+
+            embed.description = "\n\n".join(backup_list)
+        else:
+            embed.description = "no backups found"
+
+        return embed
+
+class DeleteSelectView(discord.ui.View):
+    """Delete backup selection"""
+    def __init__(self, bot, guild_id):
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.guild_id = guild_id
+
+    async def create_delete_embed(self):
+        """Create delete selection embed"""
+        async with aiosqlite.connect('bot.db') as db:
+            cursor = await db.execute('''
+                SELECT backup_name, backup_key, created_at, backup_size 
+                FROM server_backups 
+                WHERE guild_id = ? 
+                ORDER BY created_at DESC LIMIT 25
+            ''', (self.guild_id,))
+            backups = await cursor.fetchall()
+
+        embed = create_embed(
+            title="ðï¸ delete backups",
+            description="select backups to delete from the dropdown below",
+            color=0xE74C3C
+        )
+
+        embed.set_author(
+            name=f"{self.bot.user.display_name} backup deletion",
+            icon_url=self.bot.user.avatar.url if self.bot.user.avatar else self.bot.user.default_avatar.url
+        )
+
+        if backups:
+            # Add delete select menu
+            options = []
+            for backup in backups:
+                name, key, created_at, size = backup
+                if size:
+                    if size < 1024 * 1024:  # Less than 1MB, show in KB
+                        size_kb = size / 1024
+                        size_display = f"{size_kb:.1f}KB"
+                    else:  # 1MB or more, show in MB
+                        size_mb = size / 1024 / 1024
+                        size_display = f"{size_mb:.1f}MB"
+                else:
+                    size_display = "0KB"
+                options.append(discord.SelectOption(
+                    label=f"{name} ({size_display})",
+                    value=key,
+                    description=f"created: {created_at[:10]} â¢ key: {key[:8]}..."
+                ))
+
+            select = DeleteSelect(self.bot, options)
+            self.add_item(select)
+
+            embed.add_field(
+                name="â ï¸ warning",
+                value="deleted backups **cannot be recovered**!\nthis action is permanent.",
+                inline=False
+            )
+        else:
+            embed.description = "no backups found to delete"
+
+        return embed
+
+class DeleteSelect(discord.ui.Select):
+    """Select menu for backup deletion"""
+    def __init__(self, bot, options):
+        super().__init__(
+            placeholder="choose backups to delete...",
+            options=options,
+            min_values=1,
+            max_values=min(len(options), 25)
+        )
+        self.bot = bot
+
+    async def callback(self, interaction: discord.Interaction):
+        backup_keys = self.values
+
+        # Create confirmation view
+        view = DeleteConfirmView(self.bot, backup_keys)
+
+        backup_list = '\n'.join([f"â¢ `{key[:8]}...`" for key in backup_keys])
+        embed = create_embed(
+            title="â ï¸ confirm deletion",
+            description=f"are you sure you want to delete these backups?\n\n{backup_list}\n\n**this action cannot be undone!**",
+            color=0xE74C3C
+        )
+
+        embed.set_author(
+            name=f"{self.bot.user.display_name} deletion confirmation",
+            icon_url=self.bot.user.avatar.url if self.bot.user.avatar else self.bot.user.default_avatar.url
+        )
+
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+class DeleteConfirmView(discord.ui.View):
+    """Confirmation view for backup deletion"""
+    def __init__(self, bot, backup_keys):
+        super().__init__(timeout=60)
+        self.bot = bot
+        self.backup_keys = backup_keys
+
+    @discord.ui.button(label="confirm deletion", style=discord.ButtonStyle.danger)
+    async def confirm_delete(self, interaction: discord.Interaction, button: discord.ui.Button):
+        async with aiosqlite.connect('bot.db') as db:
+            placeholders = ','.join(['?' for _ in self.backup_keys])
+            await db.execute(f'''
+                DELETE FROM server_backups WHERE backup_key IN ({placeholders})
+            ''', self.backup_keys)
+            await db.commit()
+
+        embed = create_success_embed(f"deleted {len(self.backup_keys)} backup(s) successfully!")
+        embed.set_author(
+            name=f"{self.bot.user.display_name} deletion system",
+            icon_url=self.bot.user.avatar.url if self.bot.user.avatar else self.bot.user.default_avatar.url
+        )
+
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="cancel", style=discord.ButtonStyle.secondary)
+    async def cancel_delete(self, interaction: discord.Interaction, button: discord.ui.Button):
+        embed = create_embed("deletion cancelled", "no backups were deleted")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+class MigrateModal(discord.ui.Modal, title="migrate from another server"):
+    def __init__(self, bot, target_guild_id):
+        super().__init__()
+        self.bot = bot
+        self.target_guild_id = target_guild_id
+
+    server_id = discord.ui.TextInput(
+        label="source server id",
+        placeholder="enter the server id to migrate from...",
+        max_length=20,
+        required=True
+    )
+
+    backup_key = discord.ui.TextInput(
+        label="backup key",
+        placeholder="enter the backup key...",
+        max_length=50,
+        required=True
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        
+        try:
+            source_guild_id = int(self.server_id.value)
+            backup_key = self.backup_key.value.strip()
+            
+            # Verify the backup exists and user has access to source server
+            async with aiosqlite.connect('bot.db') as db:
+                cursor = await db.execute('''
+                    SELECT backup_data, backup_name FROM server_backups 
+                    WHERE backup_key = ? AND guild_id = ?
+                ''', (backup_key, source_guild_id))
+                result = await cursor.fetchone()
+                
+                if not result:
+                    embed = create_error_embed("backup not found or access denied")
+                    embed.add_field(
+                        name="possible issues",
+                        value="â¢ backup key is incorrect\nâ¢ source server id is wrong\nâ¢ backup was deleted\nâ¢ you don't have access to source server",
+                        inline=False
+                    )
+                    await interaction.followup.send(embed=embed, ephemeral=True)
+                    return
+                
+                backup_data, backup_name = result
+                
+                # Check if user is admin in both source and target servers
+                source_guild = self.bot.get_guild(source_guild_id)
+                target_guild = self.bot.get_guild(self.target_guild_id)
+                
+                if not source_guild or not target_guild:
+                    embed = create_error_embed("server access verification failed")
+                    embed.add_field(
+                        name="requirements",
+                        value="â¢ bot must be in both servers\nâ¢ you must be admin in both servers",
+                        inline=False
+                    )
+                    await interaction.followup.send(embed=embed, ephemeral=True)
+                    return
+                
+                source_member = source_guild.get_member(interaction.user.id)
+                target_member = target_guild.get_member(interaction.user.id)
+                
+                if not source_member or not target_member:
+                    embed = create_error_embed("you must be a member of both servers")
+                    await interaction.followup.send(embed=embed, ephemeral=True)
+                    return
+                
+                if not source_member.guild_permissions.administrator or not target_member.guild_permissions.administrator:
+                    embed = create_error_embed("you must be administrator in both servers")
+                    await interaction.followup.send(embed=embed, ephemeral=True)
+                    return
+                
+                # Create migration backup entry in target server
+                import uuid
+                new_backup_key = str(uuid.uuid4())[:8]
+                migration_name = f"migrated_{backup_name}"
+                created_at = datetime.now().isoformat()
+                backup_size = len(backup_data.encode('utf-8'))
+                
+                # Insert migrated backup into target server
+                await db.execute('''
+                    INSERT INTO server_backups 
+                    (guild_id, backup_name, backup_key, backup_data, backup_size, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', (self.target_guild_id, migration_name, new_backup_key, backup_data, backup_size, created_at))
+                await db.commit()
+                
+                # Clean up old backups if over limit
+                cursor = await db.execute('''
+                    SELECT COUNT(*) FROM server_backups WHERE guild_id = ?
+                ''', (self.target_guild_id,))
+                backup_count = await cursor.fetchone()
+                
+                if backup_count and backup_count[0] > 5:
+                    # Delete oldest backups to maintain 5-backup limit
+                    await db.execute('''
+                        DELETE FROM server_backups 
+                        WHERE guild_id = ? AND id NOT IN (
+                            SELECT id FROM server_backups 
+                            WHERE guild_id = ? 
+                            ORDER BY created_at DESC 
+                            LIMIT 5
+                        )
+                    ''', (self.target_guild_id, self.target_guild_id))
+                    await db.commit()
+                
+                # Ask if user wants to immediately restore the migrated backup
+                embed = create_success_embed("server backup migrated successfully")
+                embed.set_author(
+                    name=f"{self.bot.user.display_name} migration system",
+                    icon_url=self.bot.user.avatar.url if self.bot.user.avatar else self.bot.user.default_avatar.url
+                )
+                embed.add_field(
+                    name="migration details",
+                    value=f"**source:** {source_guild.name}\n**backup:** {backup_name}\n**new key:** `{new_backup_key}`",
+                    inline=False
+                )
+                embed.add_field(
+                    name="immediate restore option",
+                    value="would you like to immediately restore this backup?\n**warning:** this will completely wipe your current server",
+                    inline=False
+                )
+                
+                view = MigrationRestoreView(self.bot, new_backup_key, target_guild)
+                await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+                
+        except ValueError:
+            embed = create_error_embed("invalid server id - must be numbers only")
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        except Exception as e:
+            embed = create_error_embed(f"migration failed: {str(e)}")
+            await interaction.followup.send(embed=embed, ephemeral=True)
+
+class JSONImportModal(discord.ui.Modal, title="import backup from JSON"):
+    def __init__(self, bot, guild_id):
+        super().__init__()
+        self.bot = bot
+        self.guild_id = guild_id
+
+    backup_name = discord.ui.TextInput(
+        label="backup name",
+        placeholder="enter a name for this imported backup...",
+        max_length=50,
+        required=True
+    )
+
+    json_data = discord.ui.TextInput(
+        label="JSON backup data",
+        placeholder="paste your JSON backup data here...",
+        style=discord.TextStyle.paragraph,
+        max_length=4000,
+        required=True
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        
+        try:
+            # Parse and validate JSON
+            backup_data = json.loads(self.json_data.value)
+            
+            # Validate required fields
+            required_fields = ["guild_info", "roles", "channels"]
+            for field in required_fields:
+                if field not in backup_data:
+                    embed = create_error_embed(f"invalid JSON format - missing '{field}' field")
+                    await interaction.followup.send(embed=embed, ephemeral=True)
+                    return
+            
+            # Check backup limit (max 5 per server)
+            async with aiosqlite.connect('bot.db') as db:
+                cursor = await db.execute('''
+                    SELECT COUNT(*) FROM server_backups WHERE guild_id = ?
+                ''', (self.guild_id,))
+                backup_count = await cursor.fetchone()
+
+                if backup_count and backup_count[0] >= 5:
+                    # Delete oldest backup
+                    await db.execute('''
+                        DELETE FROM server_backups 
+                        WHERE guild_id = ? AND id = (
+                            SELECT id FROM server_backups 
+                            WHERE guild_id = ? 
+                            ORDER BY created_at ASC 
+                            LIMIT 1
+                        )
+                    ''', (self.guild_id, self.guild_id))
+                    await db.commit()
+                
+                # Generate backup key and save
+                backup_key = ''.join(random.choices(string.ascii_letters + string.digits, k=16))
+                backup_json = json.dumps(backup_data)
+                backup_size = len(backup_json.encode('utf-8'))
+                created_at = datetime.now(timezone.utc).isoformat()
+                
+                await db.execute('''
+                    INSERT INTO server_backups (guild_id, backup_name, backup_key, backup_data, backup_size, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', (self.guild_id, self.backup_name.value, backup_key, backup_json, backup_size, created_at))
+                await db.commit()
+            
+            embed = create_success_embed(f"JSON backup imported successfully!\nbackup key: `{backup_key}`")
+            embed.set_author(
+                name=f"{self.bot.user.display_name} JSON import system",
+                icon_url=self.bot.user.avatar.url if self.bot.user.avatar else self.bot.user.default_avatar.url
+            )
+            embed.add_field(
+                name="import details",
+                value=f"**name:** {self.backup_name.value}\n**size:** {backup_size / 1024:.1f}KB\n**key:** `{backup_key}`",
+                inline=False
+            )
+            
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            
+        except json.JSONDecodeError as e:
+            embed = create_error_embed(f"invalid JSON format: {str(e)}")
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        except Exception as e:
+            embed = create_error_embed(f"import failed: {str(e)}")
+            await interaction.followup.send(embed=embed, ephemeral=True)
+
+class JSONExportSelectView(discord.ui.View):
+    """Select backup to export as JSON"""
+    def __init__(self, bot, guild_id):
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.guild_id = guild_id
+
+    async def create_export_embed(self):
+        """Create export selection embed"""
+        async with aiosqlite.connect('bot.db') as db:
+            cursor = await db.execute('''
+                SELECT backup_name, backup_key, created_at, backup_size 
+                FROM server_backups 
+                WHERE guild_id = ? 
+                ORDER BY created_at DESC LIMIT 25
+            ''', (self.guild_id,))
+            backups = await cursor.fetchall()
+
+        embed = create_embed(
+            title="ð¤ export backup as JSON",
+            description="select a backup to export as JSON from the dropdown below",
+            color=0x2ECC71
+        )
+
+        embed.set_author(
+            name=f"{self.bot.user.display_name} JSON export system",
+            icon_url=self.bot.user.avatar.url if self.bot.user.avatar else self.bot.user.default_avatar.url
+        )
+
+        if backups:
+            # Add export select menu
+            options = []
+            for backup in backups:
+                name, key, created_at, size = backup
+                size_mb = size / 1024 / 1024 if size else 0
+                options.append(discord.SelectOption(
+                    label=f"{name} ({size_mb:.1f}MB)",
+                    value=key,
+                    description=f"created: {created_at[:10]} â¢ key: {key[:8]}..."
+                ))
+
+            select = JSONExportSelect(self.bot, options)
+            self.add_item(select)
+
+            embed.add_field(
+                name="export format",
+                value="exported JSON will contain all backup data including:\nâ¢ server settings and roles\nâ¢ channels and categories\nâ¢ member data and messages\nâ¢ emojis, stickers, and other assets",
+                inline=False
+            )
+        else:
+            embed.description = "no backups found to export"
+
+        return embed
+
+class JSONExportSelect(discord.ui.Select):
+    """Select menu for JSON export"""
+    def __init__(self, bot, options):
+        super().__init__(
+            placeholder="choose a backup to export as JSON...",
+            options=options,
+            min_values=1,
+            max_values=1
+        )
+        self.bot = bot
+
+    async def callback(self, interaction: discord.Interaction):
+        backup_key = self.values[0]
+        
+        await interaction.response.defer(ephemeral=True)
+        
+        try:
+            # Fetch backup data
+            async with aiosqlite.connect('bot.db') as db:
+                cursor = await db.execute('''
+                    SELECT backup_name, backup_data FROM server_backups WHERE backup_key = ?
+                ''', (backup_key,))
+                result = await cursor.fetchone()
+                
+                if not result:
+                    embed = create_error_embed("backup not found")
+                    await interaction.followup.send(embed=embed, ephemeral=True)
+                    return
+                
+                backup_name, backup_data = result
+            
+            # Create JSON file
+            json_content = json.loads(backup_data)
+            formatted_json = json.dumps(json_content, indent=2)
+            
+            # Check if JSON is too large for Discord message (8MB limit)
+            json_size = len(formatted_json.encode('utf-8'))
+            
+            if json_size > 8 * 1024 * 1024:  # 8MB limit
+                embed = create_error_embed("backup too large for Discord export (>8MB)")
+                embed.add_field(
+                    name="alternative options",
+                    value="â¢ use the regular backup system for large backups\nâ¢ consider using migration instead\nâ¢ manually split the backup data",
+                    inline=False
+                )
+                await interaction.followup.send(embed=embed, ephemeral=True)
+                return
+            
+            # Create file and send
+            json_file = discord.File(
+                io.StringIO(formatted_json),
+                filename=f"{backup_name}_{backup_key[:8]}.json"
+            )
+            
+            embed = create_success_embed("backup exported successfully!")
+            embed.set_author(
+                name=f"{self.bot.user.display_name} JSON export system",
+                icon_url=self.bot.user.avatar.url if self.bot.user.avatar else self.bot.user.default_avatar.url
+            )
+            embed.add_field(
+                name="export details",
+                value=f"**backup:** {backup_name}\n**size:** {json_size / 1024:.1f}KB\n**format:** JSON",
+                inline=False
+            )
+            embed.add_field(
+                name="usage instructions",
+                value="download the attached JSON file and use 'import JSON' to restore it in any server",
+                inline=False
+            )
+            
+            await interaction.followup.send(embed=embed, file=json_file, ephemeral=True)
+            
+        except Exception as e:
+            embed = create_error_embed(f"export failed: {str(e)}")
+            await interaction.followup.send(embed=embed, ephemeral=True)
+
+class MigrationRestoreView(discord.ui.View):
+    """View for immediate restore after migration"""
+    def __init__(self, bot, backup_key, guild):
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.backup_key = backup_key
+        self.guild = guild
+
+    @discord.ui.button(label="restore now", style=discord.ButtonStyle.danger, emoji="â¡")
+    async def restore_now(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Immediately restore the migrated backup"""
+        embed = create_embed("â³ server migration in progress", "completely wiping server and rebuilding from backup...")
+        embed.set_author(
+            name=f"{self.bot.user.display_name} migration restore",
+            icon_url=self.bot.user.avatar.url if self.bot.user.avatar else self.bot.user.default_avatar.url
+        )
+
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+        try:
+            # Use the existing restore_backup method from RestoreConfirmView
+            restore_view = RestoreConfirmView(self.bot, self.backup_key)
+            await restore_view.restore_backup(self.guild, self.backup_key)
+            
+            success_embed = create_success_embed("migration and restore completed\nserver completely rebuilt from source server")
+            success_embed.set_author(
+                name=f"{self.bot.user.display_name} migration system",
+                icon_url=self.bot.user.avatar.url if self.bot.user.avatar else self.bot.user.default_avatar.url
+            )
+            success_embed.add_field(
+                name="migration complete",
+                value="**phase 1:** everything deleted from target server\nâ¢ all roles, channels, categories\nâ¢ all emojis, stickers, webhooks\nâ¢ all member roles and nicknames\n\n**phase 2:** rebuilt from source server\nâ¢ server settings restored\nâ¢ all content recreated\nâ¢ member assignments restored\nâ¢ messages restored via webhooks\nâ¢ bans reinstated",
+                inline=False
+            )
+            await interaction.edit_original_response(embed=success_embed, view=None)
+        except Exception as e:
+            error_embed = create_error_embed(f"migration restore failed: {str(e)}")
+            error_embed.add_field(
+                name="critical issues",
+                value="â¢ bot lacks administrator permissions\nâ¢ backup corrupted or invalid\nâ¢ server may be partially destroyed",
+                inline=False
+            )
+            await interaction.edit_original_response(embed=error_embed, view=None)
+
+    @discord.ui.button(label="restore later", style=discord.ButtonStyle.secondary)
+    async def restore_later(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Skip immediate restore"""
+        embed = create_embed("migration completed", f"backup saved with key: `{self.backup_key}`\nyou can restore it later using the main backup interface")
+        await interaction.response.edit_message(embed=embed, view=None)
+
+class BackupCog(commands.Cog):
+    """Unified backup system"""
+    def __init__(self, bot):
+        self.bot = bot
+
+    async def cog_load(self):
+        """Initialize backup tables"""
+        async with aiosqlite.connect('bot.db') as db:
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS server_backups (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    guild_id INTEGER NOT NULL,
+                    backup_name TEXT NOT NULL,
+                    backup_key TEXT UNIQUE NOT NULL,
+                    backup_data TEXT NOT NULL,
+                    backup_size INTEGER DEFAULT 0,
+                    created_at TEXT NOT NULL
+                )
+            ''')
+            await db.commit()
+
+    @commands.hybrid_command(name="backup", description="unified backup & restore system")
+    @app_commands.describe()
+    async def backup(self, ctx):
+        """unified backup & restore control panel"""
+        view = BackupView(self.bot, ctx.guild.id)
+        embed = await view.create_main_embed()
+        await ctx.send(embed=embed, view=view)
+
+    
