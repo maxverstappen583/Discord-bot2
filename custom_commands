@@ -1,0 +1,292 @@
+import discord
+from discord.ext import commands
+from discord import app_commands
+from utils import *
+import aiosqlite
+
+class CustomCommandModal(discord.ui.Modal):
+    def __init__(self, command_name=None, existing_response=None):
+        super().__init__(title="custom command")
+        self.command_name = command_name
+        
+        self.name_input = discord.ui.TextInput(
+            label="command name",
+            placeholder="enter command name (without prefix)",
+            max_length=50,
+            default=command_name or ''
+        )
+        
+        self.response_input = discord.ui.TextInput(
+            label="command response",
+            placeholder="enter what the bot should respond with",
+            style=discord.TextStyle.paragraph,
+            max_length=2000,
+            default=existing_response or ''
+        )
+        
+        self.add_item(self.name_input)
+        self.add_item(self.response_input)
+    
+    async def on_submit(self, interaction: discord.Interaction):
+        command_name = self.name_input.value.lower().strip()
+        response = self.response_input.value
+        
+        if not command_name or not response:
+            await interaction.response.send_message("both command name and response are required", ephemeral=True)
+            return
+        
+        # Remove any prefix if user added it
+        for prefix in ['.', '/', '!', '?']:
+            if command_name.startswith(prefix):
+                command_name = command_name[1:]
+        
+        async with aiosqlite.connect('bot.db') as db:
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS custom_commands (
+                    guild_id INTEGER,
+                    command_name TEXT,
+                    response TEXT,
+                    created_by INTEGER,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (guild_id, command_name)
+                )
+            ''')
+            
+            # Check if command already exists
+            cursor = await db.execute('''
+                SELECT * FROM custom_commands WHERE guild_id = ? AND command_name = ?
+            ''', (interaction.guild.id, command_name))
+            existing = await cursor.fetchone()
+            
+            if existing and not self.command_name:
+                await interaction.response.send_message(f"command `{command_name}` already exists", ephemeral=True)
+                return
+            
+            # Insert or update command
+            await db.execute('''
+                INSERT OR REPLACE INTO custom_commands (guild_id, command_name, response, created_by)
+                VALUES (?, ?, ?, ?)
+            ''', (interaction.guild.id, command_name, response, interaction.user.id))
+            await db.commit()
+        
+        action = "updated" if existing else "created"
+        embed = create_success_embed(f"custom command `{command_name}` has been {action}")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+class CustomCommandsCog(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+    
+    async def cog_load(self):
+        """Called when the cog is loaded"""
+        await self.setup_custom_commands_table()
+    
+    async def setup_custom_commands_table(self):
+        """Initialize custom commands table"""
+        async with aiosqlite.connect('bot.db') as db:
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS custom_commands (
+                    guild_id INTEGER,
+                    command_name TEXT,
+                    response TEXT,
+                    created_by INTEGER,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (guild_id, command_name)
+                )
+            ''')
+            await db.commit()
+    
+    @commands.hybrid_group(name='customcmd', aliases=['cc'])
+    @is_mod_or_higher()
+    async def custom_commands(self, ctx):
+        """manage custom commands"""
+        if ctx.invoked_subcommand is None:
+            import sys; sys.path.append("."); from utils import create_command_usage_embed
+            prefix = await self.bot.get_guild_prefix(ctx.guild.id) if ctx.guild else ";"
+            embed = create_command_usage_embed(
+                self.bot, 
+                "customcmd", 
+                "create and manage server-specific custom commands that members can use - perfect for FAQs, rules, and server info", 
+                "customcmd, cc", 
+                "customcmd <create|edit|delete|list>",
+                prefix
+            )
+            await ctx.send(embed=embed, ephemeral=True)
+    
+    @custom_commands.command(name='create', aliases=['add'])
+    async def create_command(self, ctx):
+        """create a new server-specific custom command with interactive modal interface"""
+        modal = CustomCommandModal()
+        
+        # Handle both slash and prefix commands
+        if ctx.interaction:
+            await ctx.interaction.response.send_modal(modal)
+        else:
+            # For prefix commands, we need to create an interaction-like response
+            embed = create_embed(
+                title="ð create custom command",
+                description="use the slash command version (`/customcmd create`) for the interactive modal interface",
+                color=0x9B59B6
+            )
+            await ctx.send(embed=embed, ephemeral=True)
+    
+    @custom_commands.command(name='edit')
+    @app_commands.describe(command_name="name of the command to edit")
+    async def edit_command(self, ctx, *, command_name: str = None):
+        """modify the response text and settings of an existing server custom command"""
+        if not command_name:
+            import sys; sys.path.append("."); from utils import create_command_usage_embed
+            prefix = await self.bot.get_guild_prefix(ctx.guild.id) if ctx.guild else "."
+            embed = create_command_usage_embed(
+                self.bot, 
+                "customcmd edit", 
+                "modify the response text and settings of an existing server custom command", 
+                "customcmd edit, cc edit", 
+                "customcmd edit <command_name>",
+                prefix
+            )
+            await ctx.send(embed=embed, ephemeral=True)
+            return
+        await self.setup_custom_commands_table()
+        
+        command_name = command_name.lower().strip()
+        
+        async with aiosqlite.connect('bot.db') as db:
+            cursor = await db.execute('''
+                SELECT response FROM custom_commands WHERE guild_id = ? AND command_name = ?
+            ''', (ctx.guild.id, command_name))
+            result = await cursor.fetchone()
+        
+        if not result:
+            embed = create_error_embed(f"custom command `{command_name}` not found")
+            await ctx.send(embed=embed, ephemeral=True)
+            return
+        
+        modal = CustomCommandModal(command_name, result[0])
+        
+        # Handle both slash and prefix commands
+        if ctx.interaction:
+            await ctx.interaction.response.send_modal(modal)
+        else:
+            # For prefix commands, we need to create an interaction-like response
+            embed = create_embed(
+                title="ð edit custom command",
+                description="use the slash command version (`/customcmd edit`) for the interactive modal interface",
+                color=0x9B59B6
+            )
+            await ctx.send(embed=embed, ephemeral=True)
+    
+    @custom_commands.command(name='delete', aliases=['remove'])
+    @app_commands.describe(command_name="name of the command to delete")
+    async def delete_command(self, ctx, *, command_name: str = None):
+        """delete a custom command"""
+        if not command_name:
+            import sys; sys.path.append("."); from utils import create_command_usage_embed
+            prefix = await self.bot.get_guild_prefix(ctx.guild.id) if ctx.guild else "."
+            embed = create_command_usage_embed(
+                self.bot, 
+                "customcmd delete", 
+                "delete a custom command.", 
+                "customcmd delete, customcmd remove, cc delete, cc remove", 
+                "customcmd delete <command_name>",
+                prefix
+            )
+            await ctx.send(embed=embed, ephemeral=True)
+            return
+        await self.setup_custom_commands_table()
+        
+        command_name = command_name.lower().strip()
+        
+        async with aiosqlite.connect('bot.db') as db:
+            cursor = await db.execute('''
+                SELECT * FROM custom_commands WHERE guild_id = ? AND command_name = ?
+            ''', (ctx.guild.id, command_name))
+            result = await cursor.fetchone()
+            
+            if not result:
+                embed = create_error_embed(f"custom command `{command_name}` not found")
+                await ctx.send(embed=embed, ephemeral=True)
+                return
+            
+            await db.execute('''
+                DELETE FROM custom_commands WHERE guild_id = ? AND command_name = ?
+            ''', (ctx.guild.id, command_name))
+            await db.commit()
+        
+        embed = create_success_embed(f"custom command `{command_name}` has been deleted")
+        await ctx.send(embed=embed, ephemeral=True)
+    
+    @custom_commands.command(name='list')
+    async def list_commands(self, ctx):
+        """list all custom commands"""
+        await self.setup_custom_commands_table()
+        
+        async with aiosqlite.connect('bot.db') as db:
+            cursor = await db.execute('''
+                SELECT command_name, created_by FROM custom_commands WHERE guild_id = ?
+                ORDER BY command_name
+            ''', (ctx.guild.id,))
+            commands = await cursor.fetchall()
+        
+        if not commands:
+            embed = create_embed("no custom commands", "no custom commands have been created for this server")
+            await ctx.send(embed=embed)
+            return
+        
+        # Get guild prefix
+        prefix = await self.get_guild_prefix(ctx.guild.id)
+        
+        description = ""
+        for command_name, created_by in commands:
+            creator = ctx.guild.get_member(created_by)
+            creator_name = creator.display_name if creator else "unknown"
+            description += f"`{prefix}{command_name}` - created by {creator_name}\n"
+        
+        embed = create_embed("custom commands", description.strip())
+        await ctx.send(embed=embed)
+    
+    async def get_guild_prefix(self, guild_id):
+        """Get guild prefix from database"""
+        async with aiosqlite.connect('bot.db') as db:
+            cursor = await db.execute('''
+                SELECT prefix FROM guild_settings WHERE guild_id = ?
+            ''', (guild_id,))
+            result = await cursor.fetchone()
+            return result[0] if result and result[0] else '.'
+    
+    @commands.Cog.listener()
+    async def on_message(self, message):
+        """Handle custom command responses"""
+        if message.author.bot or not message.guild:
+            return
+        
+        # Get guild prefix
+        prefix = await self.get_guild_prefix(message.guild.id)
+        
+        if not message.content.startswith(prefix):
+            return
+        
+        # Extract command name
+        content_parts = message.content[len(prefix):].split()
+        if not content_parts:
+            return
+        command_name = content_parts[0].lower()
+        
+        # Check if it's a custom command
+        async with aiosqlite.connect('bot.db') as db:
+            cursor = await db.execute('''
+                SELECT response FROM custom_commands WHERE guild_id = ? AND command_name = ?
+            ''', (message.guild.id, command_name))
+            result = await cursor.fetchone()
+        
+        if result:
+            response = result[0]
+            # Replace variables
+            response = response.replace('{user}', message.author.mention)
+            response = response.replace('{server}', message.guild.name)
+            response = response.replace('{channel}', message.channel.mention)
+            
+            await message.channel.send(response)
+
+async def setup(bot):
+    await bot.add_cog(CustomCommandsCog(bot))
